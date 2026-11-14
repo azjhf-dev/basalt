@@ -321,6 +321,11 @@ if(BUILD_TESTING)
   target_include_directories(peer_take_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   basalt_embed_manifest(peer_take_test)
   basalt_cpu_test(NAME peer_take_test COMMAND peer_take_test)
+  # the data-parallel prompt chunk planner ported from rfairburn's Strata-rdna3 fork (no GPU; see fixes/README.md)
+  add_executable(dp_plan_test tests/prefill/dp_plan_test.cpp)
+  target_include_directories(dp_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  basalt_embed_manifest(dp_plan_test)
+  basalt_cpu_test(NAME dp_plan_test COMMAND dp_plan_test)
   # shared code must not include a model; models must not include each other
   # a check of the tree's text, in bash and python3: Linux's run covers it for every platform
   if(NOT WIN32)
