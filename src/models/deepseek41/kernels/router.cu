@@ -33,7 +33,9 @@ namespace {
 constexpr int kMaxTok = 8;          // tokens per logits launch
 constexpr int kLogitThreads = 256;  // one block per gate row
 constexpr int kMaxVec = 8;          // float4 per thread: n_embd <= 4 * kMaxVec * kLogitThreads
-constexpr int kMaxExpert = 512;
+
+static_assert(kRouterMaxExpert > 0 && kRouterMaxExpert % 32 == 0, "the selection block pads to whole warps");
+static_assert(kRouterMaxEmbd == 4 * kMaxVec * kLogitThreads, "the header's bound is this kernel's");
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -96,24 +98,26 @@ __device__ __forceinline__ float sqrt_softplus(float x) {
 
 // Shared memory of one token's selection.
 struct SelectScratch {
-    float wmax[kMaxExpert / 32];   // each warp's largest biased score
-    float lb[kMaxExpert];          // the candidates' biased scores and experts, in no particular order
-    int le[kMaxExpert];
+    float wmax[kRouterMaxExpert / 32];   // each warp's largest biased score
+    float lb[kRouterMaxExpert];          // the candidates' biased scores and experts, in no particular order
+    int le[kRouterMaxExpert];
     float thr;
     int n;
     float sel[8];
 };
 
-// Stage: one token, one thread per expert. An expert's rank counts the experts ahead of it (higher biased score, or
-// equal and a lower index); ranks below k are the selection, in rank order. The k-th largest warp maximum bounds the
-// k-th score from below (k distinct experts reach it), so only experts at or above it can rank below k, and they are
-// ranked among themselves.
+// Stage: one token, one thread per expert; the block is padded to whole warps and the padding lanes (e >= n_expert)
+// hold -INFINITY, so they take no candidacy and their warp's maximum is the real lanes'. An expert's rank counts the
+// experts ahead of it (higher biased score, or equal and a lower index); ranks below k are the selection, in rank
+// order. The k-th largest warp maximum bounds the k-th score from below (k distinct experts reach it), so only experts
+// at or above it can rank below k, and they are ranked among themselves.
 __device__ void router_select_token(const float* __restrict__ logits, const float* __restrict__ bias, int n_expert,
                                     int k, float scale, int32_t* __restrict__ ids, float* __restrict__ weights,
                                     SelectScratch& sh) {
-    const int e = threadIdx.x, lane = e & 31, warp = e >> 5, nw = n_expert >> 5;
-    const float s = sqrt_softplus(logits[e]);
-    const float b = s + bias[e];
+    const int e = threadIdx.x, lane = e & 31, warp = e >> 5, nw = (n_expert + 31) >> 5;
+    const bool real = e < n_expert;
+    const float s = real ? sqrt_softplus(logits[e]) : 0.f;
+    const float b = real ? s + bias[e] : -INFINITY;
     float m = b;
 #pragma unroll
     for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
@@ -131,7 +135,7 @@ __device__ void router_select_token(const float* __restrict__ logits, const floa
         }
     }
     __syncthreads();
-    const bool cand = b >= sh.thr;
+    const bool cand = real && b >= sh.thr;
     if (cand) {
         const int i = atomicAdd(&sh.n, 1);
         sh.lb[i] = b;
@@ -167,15 +171,15 @@ __global__ void router_select_kernel(const float* __restrict__ logits, const flo
 
 void router(const float* x, const float* gate, const float* bias, int n_tokens, const RouterArgs& a, float* logits,
             int32_t* ids, float* weights, void* stream) {
-    if (a.n_expert % 32 || a.n_expert > kMaxExpert || a.n_embd % 128 || a.n_embd > 4 * kMaxVec * kLogitThreads || a.k < 1 || a.k > 8 || a.k > a.n_expert)
-        throw std::invalid_argument("deepseek41 router: unsupported geometry");
+    if (!router_geometry_ok(a)) throw std::invalid_argument("deepseek41 router: unsupported geometry");
     cudaStream_t st = (cudaStream_t) stream;
     for (int t0 = 0; t0 < n_tokens; t0 += kMaxTok) {
         const int nt = n_tokens - t0 < kMaxTok ? n_tokens - t0 : kMaxTok;
         router_logits_kernel<<<a.n_expert, kLogitThreads, 0, st>>>(
             x + (size_t) t0 * a.n_embd, gate, a.n_embd, a.n_expert, nt, logits + (size_t) t0 * a.n_expert);
     }
-    router_select_kernel<<<n_tokens, a.n_expert, 0, st>>>(logits, bias, a.n_expert, a.k, a.weight_scale, ids, weights);
+    const int padded = (a.n_expert + 31) & ~31;   // whole warps: the selection shuffles with a full mask
+    router_select_kernel<<<n_tokens, padded, 0, st>>>(logits, bias, a.n_expert, a.k, a.weight_scale, ids, weights);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

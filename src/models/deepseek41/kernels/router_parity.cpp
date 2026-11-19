@@ -1,10 +1,12 @@
 // Parity test of the DeepSeek-V4.1 router: random inputs at the real geometry against a double-precision host
 // reference, independence from the window width and position, tie order, a microbench, and (with --fixture DIR)
-// real layers against the per-layer fixtures.
+// real layers against the per-layer fixtures. `--experts N` runs a pruned model's geometry (N <= 384 experts kept,
+// not a multiple of 32): every check but the 384-geometry frozen hash and the fixtures runs.
 #include "basalt/models/deepseek41/kernels.hpp"
 #include "test_util.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <utility>
@@ -14,7 +16,12 @@ using namespace basalt::models::deepseek41;
 
 namespace {
 
-constexpr int NE = 384, ND = 5120, K = 6;
+constexpr int ND = 5120, K = 6;
+int NE = 384;   // --experts N: a pruned model keeps fewer of the published 384
+
+// the two identical experts of the tie checks: 201 at the full geometry (the frozen hash covers it), the last one
+// at a pruned one
+int tie_hi() { return NE > 201 ? 201 : NE - 1; }
 
 struct Ref {
     std::vector<double> logits, biased;
@@ -60,17 +67,27 @@ Out run(const Dev<float>& gate, const Dev<float>& bias, const std::vector<float>
 
 int main(int argc, char** argv) {
     std::string fixture;
-    for (int i = 1; i < argc; ++i)
+    for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--fixture") && i + 1 < argc) fixture = argv[++i];
+        else if (!std::strcmp(argv[i], "--experts") && i + 1 < argc) NE = std::atoi(argv[++i]);
+    }
+    if (!fixture.empty() && NE != 384) {
+        std::printf("the fixtures are the 384-expert model's; run them without --experts\n");
+        return 2;
+    }
     Verdict v;
     RouterArgs a;
+    a.n_expert = NE;
+    a.n_embd = ND;
+    a.k = K;
+    if (NE != 384) std::printf("geometry: %d experts of the published 384 (--experts)\n", NE);
 
     // ---- random inputs vs the double reference
     auto gate_h = randn((size_t) NE * ND, 1, 0.02f);
     auto bias_h = randn(NE, 2, 0.05f);
     // two identical experts: equal logits and equal bias must pick the lower index first
-    std::memcpy(&gate_h[(size_t) 201 * ND], &gate_h[(size_t) 77 * ND], ND * sizeof(float));
-    bias_h[201] = bias_h[77];
+    std::memcpy(&gate_h[(size_t) tie_hi() * ND], &gate_h[(size_t) 77 * ND], ND * sizeof(float));
+    bias_h[tie_hi()] = bias_h[77];
     Dev<float> gate(gate_h), bias(bias_h);
 
     const int Tmax = 11;
@@ -126,20 +143,20 @@ int main(int argc, char** argv) {
     std::printf("window/position independence: %s\n", bitwise ? "bitwise identical" : "DIFFERS");
     v.expect(bitwise, "output depends on window width or position");
 
-    // ---- tie order: experts 77 and 201 are identical; a token that selects either selects 77 first
+    // ---- tie order: experts 77 and tie_hi() are identical; a token that selects either selects 77 first
     {
         std::vector<float> xs(x_h.begin(), x_h.begin() + ND);
         std::vector<float> tie_bias(NE, -10.f);
-        tie_bias[201] = tie_bias[77] = 5.f;
+        tie_bias[tie_hi()] = tie_bias[77] = 5.f;
         Dev<float> tb(tie_bias);
         Out o = run(gate, tb, xs, 1, a);
         std::printf("tie: top ids %d %d\n", o.ids[0], o.ids[1]);
-        v.expect(o.ids[0] == 77 && o.ids[1] == 201, "tie did not resolve to the lower index first");
+        v.expect(o.ids[0] == 77 && o.ids[1] == tie_hi(), "tie did not resolve to the lower index first");
     }
 
     // ---- frozen: the ids and weights of many tokens hash to the bits of the kernel the selection replaced, here and
-    // with every expert twinned (ties everywhere)
-    {
+    // with every expert twinned (ties everywhere). The hash is the full geometry's: a pruned run skips it.
+    if (NE == 384) {
         constexpr uint64_t kFrozen = 0x3634b0999cf64e2aull;
         uint64_t h = 1469598103934665603ull;
         const auto fnv = [&](const void* p, size_t n) {

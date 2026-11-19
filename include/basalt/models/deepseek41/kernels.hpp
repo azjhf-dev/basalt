@@ -7,6 +7,7 @@
 // token are 24 floats: pre[4], post[4], comb[16] with comb[src*4 + dst].
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -18,12 +19,23 @@ constexpr int kHcSplits = 8;          ///< partial sums per mix row (workspace s
 
 // ---- router ---------------------------------------------------------------------------------------------------
 
+constexpr int kRouterMaxExpert = 512;   ///< the selection block's threads, padded up to whole warps
+constexpr int kRouterMaxEmbd = 8192;    ///< 4 floats x 8 vectors x 256 threads of the logits block
+constexpr int kRouterMaxK = 8;          ///< the selection's weight slots
+
 struct RouterArgs {
-    int n_expert = 384;               ///< multiple of 32, at most 512
-    int n_embd = 5120;                ///< multiple of 128
-    int k = 6;                        ///< at most 8
+    int n_expert = 384;               ///< at most kRouterMaxExpert; any count works (a pruned model keeps fewer)
+    int n_embd = 5120;                ///< multiple of 128, at most kRouterMaxEmbd
+    int k = 6;                        ///< at most kRouterMaxK and n_expert
     float weight_scale = 1.5f;        ///< multiplies the normalised weights
 };
+
+/// The geometries router() takes (it throws invalid_argument on anything else). n_expert need not be a multiple of
+/// 32: the selection block rounds its threads up to whole warps and the padding lanes rank last.
+inline bool router_geometry_ok(const RouterArgs& a) {
+    return a.n_expert >= 1 && a.n_expert <= kRouterMaxExpert && a.n_embd % 128 == 0 && a.n_embd >= 128 &&
+           a.n_embd <= kRouterMaxEmbd && a.k >= 1 && a.k <= kRouterMaxK && a.k <= a.n_expert;
+}
 
 /// logits = gate . x (fp32, gate row-major [n_expert][n_embd]); s = sqrt(softplus(logit)); the top-k of s + bias
 /// are chosen (the lower index wins a tie); weights are the unbiased s of those experts, divided by their sum plus
