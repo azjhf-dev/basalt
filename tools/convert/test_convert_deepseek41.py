@@ -74,7 +74,7 @@ class DeepSeek41Test(unittest.TestCase):
     def args(self, **kw):
         d = dict(gguf=[str(self.gguf)], mmproj=None, out=str(self.t / "out.basalt"), mtp_source=None, mtp_dense=None,
                  draft_vocab=None, profile=None, profile_from=None, hc8=None, name="Tiny", compat_bf16=False,
-                 no_vision=False, force=False, sections_from=None)
+                 no_vision=False, force=False, sections_from=None, engram_gguf=None)
         d.update(kw)
         return type("A", (), d)()
 
@@ -298,3 +298,82 @@ class FromBaseTest(DeepSeek41Test):
         short.write_bytes(full.read_bytes()[:-len(self.raw["per_layer_token_embd.weight"])])
         with self.assertRaises(SystemExit):
             convert.convert(self.args(gguf=[str(short)]))
+
+
+class SplitEngramTest(DeepSeek41Test):
+    """--engram-gguf: the Engram table is a GGUF of its own (a split release whose table llama.cpp takes with --ple)."""
+
+    def write_split(self, head_vocab_in_main=True):
+        P = "deepseek41."
+        g = GGUFWriter()
+        g.add("general.architecture", "deepseek41")
+        g.add("general.name", "Tiny-DS")
+        g.add(P + "block_count", N_LAYERS, "u32")
+        g.add(P + "embedding_length", 256, "u32")
+        g.add(P + "expert_count", N_EXPERT, "u32")
+        g.add(P + "expert_used_count", 2, "u32")
+        g.add(P + "embedding_length_per_layer_input", 256, "u32")
+        g.add(P + "ple.layer_multipliers", [7, 11], "array:u64")
+        g.add(P + "ple.head_offsets", [0, 2], "array:u64")
+        if head_vocab_in_main:
+            g.add(P + "ple.head_vocab_sizes", [2, 3], "array:u64")
+        g.add(P + "engram.vocab_size", 16, "u32")
+        g.add(P + "engram.token_map", [0, 1, 2, 3], "array:u32")
+        g.add("tokenizer.ggml.tokens", TOKENS)
+        g.add_raw("token_embd.weight", [256, 3], "Q6_K", self.raw["token_embd.weight"])
+        for l in range(N_LAYERS):
+            g.add_f32(f"blk.{l}.ffn_gate_inp.weight", np.ones((8, N_EXPERT)))
+            g.add_f32(f"blk.{l}.attn_norm.weight", np.ones(8))
+            g.add_raw(f"blk.{l}.attn_q_a.weight", [256, 2], "Q6_K", self.raw[f"blk.{l}.attn_q_a.weight"])
+            for role, ty in (("gate", GU[l]), ("up", GU[l]), ("down", DOWN[l])):
+                n = f"blk.{l}.ffn_{role}_exps.weight"
+                g.add_raw(n, [256, 2, N_EXPERT], ty, self.raw[n])
+        main = g.write(self.t / "split-00001-of-00001.gguf")
+
+        e = GGUFWriter()
+        e.add("split.no", 0, "u32")
+        e.add("split.count", 1, "u32")
+        if not head_vocab_in_main:
+            e.add(P + "ple.head_vocab_sizes", [2, 3], "array:u64")
+        e.add_raw("per_layer_token_embd.weight", [256, ROWS], "IQ4_NL", self.raw["per_layer_token_embd.weight"])
+        engram = e.write(self.t / "engram.gguf")
+        return main, engram
+
+    def test_table_from_its_own_gguf(self):
+        main, engram = self.write_split()
+        convert.convert(self.args(gguf=[str(main)], engram_gguf=str(engram)))
+        m = ModelFile(str(self.t / "out.basalt"))
+        for n in m.names():
+            self.assertTrue(m.verify(n), n)
+        self.assertEqual(m.read("engram"), self.raw["per_layer_token_embd.weight"])
+        meta = json.loads(m.read("meta"))
+        e = meta["engram"]
+        self.assertEqual((e["rows"], e["row_values"], e["row_bytes"], e["bytes"]), (ROWS, 256, 144, ROWS * 144))
+        self.assertEqual(e["ple.layer_multipliers"], [7, 11])
+        self.assertEqual(e["ple.head_vocab_sizes"], [2, 3])
+        t = meta["tensors"]["per_layer_token_embd.weight"]
+        self.assertEqual((t["section"], t["offset"], t["type"], t["shape"]), ("engram", 0, "IQ4_NL", [256, ROWS]))
+        paths = [x["path"] for x in meta["sources"]]
+        self.assertIn("engram.gguf", paths)
+        self.assertIn("split-00001-of-00001.gguf", paths)
+
+    def test_metadata_the_model_lacks_is_read_from_the_engram_file(self):
+        main, engram = self.write_split(head_vocab_in_main=False)
+        convert.convert(self.args(gguf=[str(main)], engram_gguf=str(engram)))
+        meta = json.loads(ModelFile(str(self.t / "out.basalt")).read("meta"))
+        self.assertEqual(meta["engram"]["ple.head_vocab_sizes"], [2, 3])
+
+    def test_split_without_the_flag_is_refused(self):
+        main, _ = self.write_split()
+        with self.assertRaises(SystemExit):
+            convert.convert(self.args(gguf=[str(main)]))
+
+    def test_flag_with_the_table_in_the_model_is_refused(self):
+        _, engram = self.write_split()
+        with self.assertRaises(SystemExit):   # self.gguf holds the table itself
+            convert.convert(self.args(engram_gguf=str(engram)))
+
+    def test_flag_with_a_tableless_file_is_refused(self):
+        main, _ = self.write_split()
+        with self.assertRaises(SystemExit):
+            convert.convert(self.args(gguf=[str(main)], engram_gguf=str(main)))

@@ -1,7 +1,7 @@
 """Build the single .basalt model file from the source GGUF shards.
 
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --mmproj MMPROJ.gguf --out MODEL.basalt \\
-        [--mtp-source DIR] [--mtp-dense FILE] [--draft-vocab FILE] [--name NAME] [--compat-bf16] [--no-vision] [--force]
+        [--engram-gguf FILE] [--mtp-source DIR] [--mtp-dense FILE] [--draft-vocab FILE] [--name NAME] [--compat-bf16] [--no-vision] [--force]
     python3 tools/convert/convert.py --gguf MODEL-00001-of-0000N.gguf --sections-from BASE.basalt --out MODEL.basalt [--name NAME] [--force]
     python3 tools/convert/convert.py --dspark FILE --into PACK.basalt --undo-dir DIR
     python3 tools/convert/convert.py --sections-from BASE.basalt --checkpoint DIR --out MODEL.basalt [--dense-q8-0] [--mtp-dense FILE] \\
@@ -12,6 +12,9 @@
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
+  --engram-gguf FILE deepseek41 only: the Engram table's GGUF, when the model GGUF does not hold
+                     per_layer_token_embd.weight (a split release whose table llama.cpp takes with --ple).
+                     Metadata keys the model lacks are read from this file's header as a fallback.
   --sections-from BASE.basalt  with --gguf: the drafter, DSpark and vision sections are copied from BASE byte for byte
                      (BASE's vocabulary must be the GGUF's); replaces --mmproj, --mtp-*, --draft-vocab and --dspark. A
                      tensor with a section of its own (the Engram table) whose shard stops after its header is copied
@@ -366,6 +369,35 @@ def convert(a) -> None:
         model = S.SourceModel(paths, frozenset(arch.own_sections) if base is not None else frozenset())
         kv, tensors = source_tensors(model, arch.own_sections)
         own = {n: model.where[n][1] for n in arch.own_sections if n in model.where}
+        engram_src = None      # --engram-gguf: (path, GGUFFile) holding the tensors `engram_names`
+        engram_names = set()
+        if getattr(a, "engram_gguf", None):
+            if not arch.own_sections:
+                die(f"--engram-gguf: {arch.name} packs hold no tensor section of their own for it")
+            missing_own = [n for n in arch.own_sections if n not in own]
+            if not missing_own:
+                die("the model GGUF holds the Engram table itself; drop --engram-gguf")
+            from gguf_reader import GGUFFile
+            ep = Path(a.engram_gguf)
+            if not ep.is_file():
+                die(f"missing input: {ep}")
+            try:
+                eg = GGUFFile(ep)
+            except (ValueError, KeyError, struct.error) as e:
+                die(f"{ep}: {e}")
+            by_name = {t.name: t for t in eg.tensors}
+            for n in missing_own:
+                t = by_name.get(n)
+                if t is None:
+                    die(f"{ep} holds no {n} (the Engram table)")
+                nb = t.expected_bytes()
+                if nb is None or eg.data_start + t.offset + nb > ep.stat().st_size:
+                    die(f"{ep}: {n} is truncated")
+                own[n] = t
+                engram_names.add(n)
+            for k, v in eg.metadata.items():
+                kv.setdefault(k, json_safe(v))
+            engram_src = (ep, eg)
         if not arch.side_sections:
             arch.check(kv, own)
         for k, v in arch.sampling_kv.items():
@@ -418,7 +450,11 @@ def convert(a) -> None:
             copied = []
             for name, section in arch.own_sections.items():
                 t = own[name]
-                if name in model.short:   # its shard stops after the header: the same tensor's section in the base
+                if name in engram_names:   # --engram-gguf: the table is a GGUF of its own
+                    ep, eg = engram_src
+                    size = t.expected_bytes()
+                    job.file(section, ep, eg.data_start + t.offset, size)
+                elif name in model.short:   # its shard stops after the header: the same tensor's section in the base
                     size = t.expected_bytes()
                     bt = base_meta.get("tensors", {}).get(name, {})
                     if (bt.get("section"), bt.get("type_id"), bt.get("shape"), bt.get("bytes")) != \
@@ -473,7 +509,8 @@ def convert(a) -> None:
             if dspark is not None:
                 job.file("dspark/gguf", dspark)
 
-            sources = [source_record(p) for p in model.paths + ([mmproj] if vision and base is None else []) + ([dspark] if dspark else [])]
+            sources = [source_record(p) for p in model.paths + ([mmproj] if vision and base is None else []) +
+                       ([engram_src[0]] if engram_src else []) + ([dspark] if dspark else [])]
             meta = {
                 "format": "basalt", "version": 2, "name": a.name,
                 "converter": {"tool": "tools/convert/convert.py"},
@@ -761,6 +798,9 @@ def main():
                          "else from the checkpoint or the GGUF")
     ap.add_argument("--gguf", action="append", metavar="FILE",
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
+    ap.add_argument("--engram-gguf", metavar="FILE",
+                    help="deepseek41: the Engram table's GGUF when the model GGUF does not hold "
+                         "per_layer_token_embd.weight (a split release)")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
     ap.add_argument("--dspark", metavar="FILE", help="deepseek41: the DSpark drafter GGUF, stored whole as dspark/gguf")
     ap.add_argument("--into", metavar="PACK.basalt", help="with --dspark: add it to this pack, whose other sections stay as they are")
@@ -791,7 +831,7 @@ def main():
                     help="with --gguf: print every section's offset and size and write nothing")
     a = ap.parse_args()
     if a.into or a.roll_back or a.undo_dir:
-        if not a.into or not a.undo_dir or bool(a.dspark) == a.roll_back or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k:
+        if not a.into or not a.undo_dir or bool(a.dspark) == a.roll_back or a.out or a.gguf or a.sections_from or a.checkpoint or a.requant_dense_q6k or a.engram_gguf:
             ap.error("--into takes --undo-dir and either --dspark or --roll-back, and nothing else")
         add_dspark(a)
         return
@@ -800,12 +840,12 @@ def main():
     if a.dspark and (a.checkpoint or a.requant_dense_q6k or a.sections_from):
         ap.error("--dspark goes with --gguf")
     if a.requant_dense_q6k:
-        if a.sections_from or a.gguf or a.dense_q8_0:
+        if a.sections_from or a.gguf or a.dense_q8_0 or a.engram_gguf:
             ap.error("--requant-dense-q6k takes only --checkpoint, --out, --workers and --force")
         requant_dense(a)
         return
     if a.sections_from and a.checkpoint:
-        if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab:
+        if a.gguf or a.mmproj or a.mtp_source or a.draft_vocab or a.engram_gguf:
             ap.error("--checkpoint with --sections-from takes only --out, --name, --mtp-dense, --dense-q8-0, "
                      "--stream-shards, --workers and --force")
         if not Path(a.checkpoint).is_dir():
@@ -815,7 +855,7 @@ def main():
         from_checkpoint(a)
         return
     if a.checkpoint:
-        if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards:
+        if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards or a.engram_gguf:
             ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --workers and --force")
         if a.drafter and not Path(a.drafter).is_dir():
             ap.error(f"missing input: {a.drafter}")

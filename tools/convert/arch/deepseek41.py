@@ -90,7 +90,8 @@ class DeepSeek41(Arch):
         from model_sections import ConvertError
         t = own.get(ENGRAM_TENSOR)
         if t is None:
-            raise ConvertError(f"the model has no {ENGRAM_TENSOR} (the Engram table)")
+            raise ConvertError(f"the model has no {ENGRAM_TENSOR} (the Engram table); when the table is a GGUF of "
+                               f"its own (a split release), pass it with --engram-gguf")
         if t.type_id != IQ4_NL or len(t.shape) != 2 or int(t.shape[0]) != ENGRAM_ROW_VALUES:
             raise ConvertError(f"{ENGRAM_TENSOR} is {t.type_name} {list(t.shape)}; expected rows of "
                                f"{ENGRAM_ROW_VALUES} IQ4_NL values")
