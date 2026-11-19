@@ -28,8 +28,8 @@ namespace {
 constexpr size_t kMaxPending = 128;              // copies claimed a window
 constexpr size_t kEvents = 2 * kMaxPending;      // a window's and the last one's copies
 
-// The usual routing order of this model's experts: the RAM and VRAM tiers start from the head of it.
-constexpr int kRankLayers = 40, kRankExperts = 384;
+// The usual routing order of this model's experts comes from the expert profile (load_rank); the RAM and VRAM tiers
+// start from the head of it. Without a profile (a pruned pack ships none) the file's order stands in.
 }  // namespace
 
 ExpertTier::ExpertTier(const DsModel& model) : m_(model) {}
