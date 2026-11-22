@@ -29,14 +29,14 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from gguf_reader import GGUFReader  # noqa: E402  (name check: adjust to the actual class in tools/gguf_reader.py)
+from gguf_reader import GGUFFile  # noqa: E402
 
 
 def inventory(path: str) -> None:
-    r = GGUFReader(path)
-    for name, shape, dtype in r.tensors():
-        print(f"{name}\t{dtype}\t{shape}")
-    for k, v in r.metadata():
+    g = GGUFFile(path)
+    for t in g.tensors:
+        print(f"{t.name}\ttype_id={t.type_id}\t{t.shape}")
+    for k, v in g.metadata.items():
         print(f"@{k} = {v}")
 
 
