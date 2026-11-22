@@ -4,6 +4,7 @@
 
 # Every model that ships: the architecture ids, as `general.architecture` names them.
 set(BASALT_BUILTIN_MODELS qwen4exp deepseek41 qwen35)
+# inkling2: scaffolding on branch inkling2-mini (src/models/inkling2); join this list when make_adapter() is implemented
 
 set(BASALT_MODELS "${BASALT_BUILTIN_MODELS}" CACHE STRING
     "Semicolon list of the models to build, from: ${BASALT_BUILTIN_MODELS}")
