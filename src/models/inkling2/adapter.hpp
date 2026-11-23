@@ -1,19 +1,12 @@
-// src/models/inkling2/adapter.hpp - model entry points, mirroring src/models/qwen4exp/adapter.hpp.
-// STATUS: scaffolding, UNCOMPILED. make_adapter() returns nullptr until the ModelAdapter methods
-// (validate/describe/load/tokens/session) are implemented over include/basalt/model/adapter.hpp.
+// src/models/inkling2/adapter.hpp - the Inkling 2 adapter's entry points.
 #pragma once
-#include "basalt/model/adapter.hpp"
 
-#include <memory>
+#include <cstddef>
 #include <vector>
 
 namespace basalt::models::inkling2 {
-struct Options;  // decode/prefill options: kv quant (int8 default), max context, resident experts
-}
 
-namespace basalt::models::inkling2 {
-std::unique_ptr<model::ModelAdapter> make_adapter();
-int run_engine(Options& o, std::vector<program::GpuCard>& cards);
-bool parse_flag(const std::string& name, model::FlagArgs& args, Options& o, int& code);
-std::optional<int> finish_flags(Options& o);
-}
+/// The inkling2 pre-tokenizer (OpenAI's o200k split): `ends` gets where each piece of the text ends.
+void pretok_inkling2(const char* text, size_t size, std::vector<size_t>& ends);
+
+}  // namespace basalt::models::inkling2

@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next
 
-Runs with the same command as any model: `basalt serve PACK`. What it supports next to DeepSeek: [models](index.md). Rounding and
+Runs with the same command as any model: `basalt serve PACK`. What it supports next to the others: [models](index.md). Rounding and
 quality: [precision](../precision/qwen38-flash-next.md).
 
 ## Pack
@@ -26,6 +26,7 @@ Sizes are on the card. The layout, and how to build a pack: [model file](../mode
   is held: the PLE rows at the largest chunk, a layer split's hand-offs, and the prompt split's weights, hand-offs and staging.
   Each buffer takes its held RAM when it is made; what none takes goes back before the top-up. The copy then leaves
   `--ram-reserve-mib` free beside the driver's page tracking (`RAM floor X GiB of N GiB free` when experts stay on the SSD).
+  The start's pass fills the main card first; the copy takes its RAM as the pass reads into it and is page-locked once read.
 - **Cards:** every card after the main one is an expert tier, up to three. Matched cards may split the layers instead
   ([GPUs](../configuration/gpus.md)).
 - **Elastic KV:** with `--max-context` above 32,768 (and not with `--kv-resident`, `--vram-elastic` or a layer split), each session
@@ -54,13 +55,18 @@ and prose least.
 
 `--parallel N` (1 to 8) serves N requests at once ([running](../running.md#concurrent-requests---parallel-n)).
 
+## Images and video
+
+`--vision dynamic`, a GPU number or `cpu` ([vision](../running.md#vision---vision)). Video works with images on and FFmpeg on the
+machine; frames decode on the GPU with NVDEC ([video](../running.md#video)).
+
 ## Lossy flags
 
 Off by default. `--relaxed-drafting`, `--route-prior` and `--route-tail-skip` each change output, and each is named in one start
-warning. What they do and what they cost: [precision](../precision/qwen38-flash-next.md#relaxed-drafting).
+warning. What they do and what they cost: [precision](../precision/qwen38-flash-next.md#relaxed-drafting); the two routing flags
+work the same on every MoE model ([quality](../precision/quality.md#lossy-routing-flags)).
 
 ## Limits
 
-- **No video.**
 - **Two-card idle sleep** can drop the second card's experts until restart (seen at context 8,192 without elastic KV, not at 64K or
   262,144).
