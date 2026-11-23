@@ -5,6 +5,8 @@
 #include "context.hpp"
 #include "../../../program/generate/run.hpp"
 #include "models/qwen4exp/adapter.hpp"
+#include "basalt/core/on_device.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 
 namespace basalt::models::qwen4exp {
 
@@ -284,6 +286,45 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
                                  basalt::prefill::mmq::fits(f.d_type, f.n_embd)
                              ? "MMQ" : "dequant GEMM");
             l = e + 1;
+        }
+        // Load every MMQ tile this engine can launch, on each card it can launch on, before the expert placement
+        // fills the cards.  A tile's first launch otherwise loads its kernel code and raises its dynamic shared-
+        // memory limit right there (CUDA_SET_SHARED_MEMORY_LIMIT in mmq.cuh); on a card packed to
+        // --vram-reserve-mib / --peer-reserve-mib that load has no VRAM left, cudaFuncSetAttribute fails "out of
+        // memory" and the engine dies.  The first launches of a verify window's small-J tiles happen in decode
+        // (prefill's chunks use the large ones), so the failure surfaced in decode with prefill unaffected.
+        auto mmq_preload = [&](int t, int64_t rows) {
+            if (basalt::prefill::mmq::fits(t, rows)) basalt::prefill::mmq::load(t, rows);
+        };
+        for (int pass = 0; pass < 2; ++pass) {
+            // the second card computes its experts' rows of the prompt and verify windows (PeerShare, the
+            // verifier's peer tier): it needs the same tiles; the drafter's projections stay on the main card
+            if (pass == 1 && o.peer_device < 1) break;
+            const basalt::core::OnDevice on_peer(pass == 1 ? o.peer_device : -1);   // a negative device does nothing
+            for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size();) {
+                const auto& f = lay.fmt[(size_t) l];
+                int64_t e = l;
+                while (e + 1 < (int64_t) lay.fmt.size() && lay.fmt[(size_t) e + 1].gu_type == f.gu_type &&
+                       lay.fmt[(size_t) e + 1].up_type == f.up_type && lay.fmt[(size_t) e + 1].d_type == f.d_type)
+                    ++e;
+                if (f.up_type == f.gu_type) {
+                    mmq_preload(f.gu_type, 2 * f.n_ff);   // the fused gate+up product
+                } else {
+                    mmq_preload(f.gu_type, f.n_ff);       // a product each, into the halves of GU
+                    mmq_preload(f.up_type, f.n_ff);
+                }
+                mmq_preload(f.d_type, f.n_embd);          // the down product
+                l = e + 1;
+            }
+            if (!lay.native) {   // the Q2_0 pack: its blobs convert to GGUF Q2_0 blocks on the gather (type 42)
+                mmq_preload(42, 2 * g0.n_ff);
+                mmq_preload(42, g0.n_embd);
+            }
+            if (pass == 0) {   // the drafter's dense Q8_0 projections run on the main card only (draft_kv.cpp)
+                constexpr int kQ8_0 = 8;   // GGML_TYPE_Q8_0
+                mmq_preload(kQ8_0, g0.n_embd);
+                mmq_preload(kQ8_0, (int64_t) g0.n_head_kv * g0.head_dim);
+            }
         }
     }
     // The PCIe share of the missed experts.  The GPU's SMs read that share over the link (the copy kernel), so on a
