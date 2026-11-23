@@ -275,6 +275,17 @@ void Context::run(const Product& p, void* stream) {
 }
 
 void load(int t, int64_t w_rows) {
+    // the stream-k fixup's scratch, once per device: a launch takes at most nsm blocks x the largest tile (J=128,
+    // I=128), and a first cudaMalloc of it mid-run can meet a card packed to its reserve.  3 buffers cover the
+    // streams that overlap on one card; the pool grows beyond them if it must, with a clear message now.
+    int dev = 0;
+    cudaGetDevice(&dev);
+    static bool scratch_done[GGML_CUDA_MAX_DEVICES] = {};
+    if (dev >= 0 && dev < GGML_CUDA_MAX_DEVICES && !scratch_done[dev]) {
+        scratch_done[dev] = true;
+        const size_t nsm = (size_t) ggml_cuda_info().devices[dev].nsm;
+        ggml_cuda_mmq_scratch_reserve(dev, nsm * 128 * 128 * sizeof(float), 3);
+    }
     with_type((ggml_type) t, [&](auto c) { mul_mat_q_load<decltype(c)::value>(w_rows); });
 }
 

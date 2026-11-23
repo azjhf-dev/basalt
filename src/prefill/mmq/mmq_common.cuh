@@ -53,6 +53,10 @@ int ggml_cuda_get_device();
 // Loads kernel `symbol` into the current context now (the driver's cuFuncLoad).
 void ggml_cuda_func_load(const void * symbol);
 
+// Keeps `count` scratch buffers of `bytes` cached on `device` (the stream-k fixup's launch pool, shared by every
+// context on the device), so a launch's first scratch take never cudaMallocs on a packed card.
+void ggml_cuda_mmq_scratch_reserve(int device, size_t bytes, int count);
+
 #define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
     do {                                                                                                   \
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \

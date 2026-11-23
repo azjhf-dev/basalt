@@ -326,15 +326,16 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
                 mmq_preload(kQ8_0, (int64_t) g0.n_head_kv * g0.head_dim);
             }
         }
-        // A tiny peer reserve starves every late VRAM user on the peer card, not just the kernel loads the preload
-        // above removes: measured on a 5090 + 5060 Ti (16 GiB peer), 128 MiB died in decode 3/3 (cudaFuncSetAttribute
-        // "out of memory" in mmq.cuh) where 192 MiB and up all passed.  Warn rather than refuse: the need scales
-        // with the pack and the peer card, so no floor fits every box.
+        // A tiny peer reserve starves every late VRAM user on the peer card.  Measured on a 5090 + 5060 Ti
+        // (16 GiB peer): at 128 MiB the pair died in decode - cudaFuncSetAttribute "out of memory" at 64K context,
+        // a cudaMalloc of MMQ scratch at 262K - while 192 MiB passed at every context tested (64K and 262K).  The
+        // preload above and the scratch reserve in mmq::load remove those two late users; what remains is
+        // unmeasured, so warn rather than refuse: the need scales with the pack and the card.
         if (o.peer_device >= 1 && o.peer_reserve_mib < 192)
             basalt::log::warn("basalt generate", "--peer-reserve-mib %d: a peer reserve under 192 MiB is unverified - "
-                              "at 128 MiB a 5090 + 5060 Ti pair died in decode with cudaFuncSetAttribute \"out of "
-                              "memory\" (a late kernel load with no VRAM left); 192 MiB is the lowest seen to pass. "
-                              "Raise it if the peer card misbehaves", o.peer_reserve_mib);
+                              "at 128 MiB a 5090 + 5060 Ti pair died in decode (cudaFuncSetAttribute at 64K context, "
+                              "an MMQ scratch cudaMalloc at 262K); 192 MiB is the lowest seen to pass at every "
+                              "context tested.  Raise it if the peer card misbehaves", o.peer_reserve_mib);
     }
     // The PCIe share of the missed experts.  The GPU's SMs read that share over the link (the copy kernel), so on a
     // slower link it must shrink or the window waits for it.  The real H2D bandwidth is probed once; from 20 GB/s up
