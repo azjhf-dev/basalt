@@ -1,5 +1,8 @@
 # ERNIE 5.5 Flash Preview on Basalt: port plan
 
+Update: [iteration 2 converter status and corrections](ernie55-flash-converter.md). Read those corrections
+before using the preliminary SSD traffic, cache sizing or Preview MTP description below.
+
 Iteration 1 (2026-11-24): feasibility and memory plan. Nothing GPU-tested yet; the agent's sandbox has
 no GPU or CUDA toolkit, so every build here is a compile check and every runtime number needs Ash's
 5090 + 5060 Ti box. Fork-only work (azjhf-dev/basalt); no upstream issues or PRs, per Ash 2026-11-23.
