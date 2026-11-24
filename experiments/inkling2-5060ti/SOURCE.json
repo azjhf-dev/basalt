@@ -2,7 +2,7 @@
   "source_repository": "https://github.com/xyehya/basalt",
   "source_branch": "inkling2-5080-setup",
   "source_sha": "3fdb44e9314abd4007fa0112ddd46e7fe2b40040",
-  "baseline_sha": "cea3989c11e7314acc8d0c1c4393c0a7b47dabe6",
+  "baseline_sha": "400b411c58031d064812ea21a259b2381acdaa3e",
   "fork_parent_sha": "e9db1aeabdc190f4e6ba2ed058ea55219e360fbc",
   "protected_qfn_sha": "94d06f7a0bba070f9ca00530fd4751a2dff0aaed",
   "snapshot_exception": "Preserve existing fork main .github/workflows unchanged; no workflow token scope",
@@ -37,5 +37,17 @@
       "merged": false,
       "head_sha": "a22f6d9f8adb4c229da9947109a3ddae79a5a80b"
     }
-  }
+  },
+  "baseline_tag_object_sha": "cea3989c11e7314acc8d0c1c4393c0a7b47dabe6",
+  "upstream_repository": "https://github.com/jesdga95/basalt",
+  "upstream_base_sha": "db8c8948cfe2297b4c86d95ac35c73eba124679f",
+  "upstream_main_at_verification": "db8c8948cfe2297b4c86d95ac35c73eba124679f",
+  "nearest_release": "v0.5.7",
+  "source_describe": "v0.5.7-82-g3fdb44e9",
+  "upstream_base_describe": "v0.5.7-6-gdb8c8948",
+  "upstream_commits_after_release": 6,
+  "source_commits_after_release": 82,
+  "source_commits_after_base": 76,
+  "source_first_parent_commits_after_release": 10,
+  "source_first_parent_commits_after_base": 4
 }

@@ -17,6 +17,43 @@ this experiment. Source changes are a snapshot commit on a new branch, not a mer
 into the working QFN branch. Upstream attribution and MIT license are retained.
 `fix-qwen4exp-mmq-preload` stays at `94d06f7a0bba070f9ca00530fd4751a2dff0aaed`.
 
+## Exact upstream version and base
+
+Pinned against `jesdga95/basalt`, verified 2026-11-24:
+
+| Item | Exact pin |
+| --- | --- |
+| Upstream base, also the merge-base with fetched upstream main | `db8c8948cfe2297b4c86d95ac35c73eba124679f` |
+| Nearest release | `v0.5.7` |
+| Release commit (dereferenced annotated tag) | `400b411c58031d064812ea21a259b2381acdaa3e` |
+| Annotated tag object, not a source commit | `cea3989c11e7314acc8d0c1c4393c0a7b47dabe6` |
+| Community combined source snapshot | `3fdb44e9314abd4007fa0112ddd46e7fe2b40040` |
+
+The upstream base is **6 commits after v0.5.7** (`v0.5.7-6-gdb8c8948`).
+The combined snapshot is **82 reachable commits after v0.5.7**, or **76 after
+that upstream base**, counting merged side-branch history. Along the first-parent
+line it is 10 commits after the release: 6 upstream commits plus 4 integration
+merge commits. `git describe --tags --long` reports `v0.5.7-82-g3fdb44e9`.
+These counts describe the imported source's history, not this fork's snapshot
+commit ancestry, and do not mean 82 independent optimizations.
+
+The 6 upstream commits after the release include #633's batch/window sizing,
+#626's Inkling tensor-core shared-KV attention, #639's community result, two dense
+prompt-split pipeline changes, and a documentation update. They are part of the
+bundle A/B, not effects attributable to the five open PRs alone.
+
+Reproduce from the author's history (the new fork branch is a snapshot):
+
+```bash
+git fetch https://github.com/xyehya/basalt.git inkling2-5080-setup
+git fetch https://github.com/jesdga95/basalt.git main tag v0.5.7
+# The fetched main was db8c8948... when verified. Pin it below, not a moving main.
+git merge-base 3fdb44e9314abd4007fa0112ddd46e7fe2b40040 db8c8948cfe2297b4c86d95ac35c73eba124679f
+git describe --tags --long 3fdb44e9314abd4007fa0112ddd46e7fe2b40040
+git rev-list --count v0.5.7..3fdb44e9314abd4007fa0112ddd46e7fe2b40040
+git rev-list --count db8c8948cfe2297b4c86d95ac35c73eba124679f..3fdb44e9314abd4007fa0112ddd46e7fe2b40040
+```
+
 ## Gate before running
 
 Use Linux, CUDA 13+, CMake 3.24+, GCC 13+ and sufficient system RAM. The full pack is
@@ -57,7 +94,7 @@ From an existing clone of **azjhf-dev/basalt**, not from the QFN worktree:
 git fetch origin experiment/inkling2-5060ti-5080-bundle
 git fetch https://github.com/jesdga95/basalt.git tag v0.5.7
 git worktree add ../inkling-ab-bundle origin/experiment/inkling2-5060ti-5080-bundle
-git worktree add --detach ../inkling-ab-v057 cea3989c11e7314acc8d0c1c4393c0a7b47dabe6
+git worktree add --detach ../inkling-ab-v057 400b411c58031d064812ea21a259b2381acdaa3e
 for tree in ../inkling-ab-v057 ../inkling-ab-bundle; do
   cmake -S "$tree" -B "$tree/build" -DCMAKE_BUILD_TYPE=Release \
     -DBASALT_MODELS=inkling2 -DBUILD_TESTING=ON
