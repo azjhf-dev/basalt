@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "models": [
+    {
+      "model": "REPLACE_WITH_ABSOLUTE_MODEL_PATH",
+      "gpu": "0",
+      "max-context": 262144,
+      "kv": "int8",
+      "spec": 8
+    }
+  ],
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8081
+  }
+}

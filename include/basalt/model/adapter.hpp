@@ -8,6 +8,12 @@
 #include "basalt/core/checkpoint_regions.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/sampler.hpp"
+#include "basalt/model/multi_gpu.hpp"
+#include "basalt/model/peer_hooks.hpp"
+#include "basalt/model/rope_flags.hpp"
+#include "basalt/model/route_flags.hpp"
+#include "basalt/program/gpu_select.hpp"
+#include "basalt/program/grammar/reply_form.hpp"
 #include "basalt/program/grammar/tool_form.hpp"
 
 #include <cstdint>
@@ -22,10 +28,10 @@ class GgufFile;
 }
 namespace basalt::core {
 struct ConversationKv;
+class LoadPlan;
 }
 namespace basalt::program {
 struct CommonOptions;
-struct GpuCard;
 struct ProbeEnv;
 }
 
@@ -63,7 +69,9 @@ struct TokenizerSpec {
 };
 
 /// Outcome of a model operation.
-enum class Status { Ok, NotImplemented, Error };
+/// Refused: the request cannot run (no room for its positions) and the session holds what it held before it; the engine
+/// answers ERR and serves the next request. Error: the session cannot go on.
+enum class Status { Ok, NotImplemented, Error, Refused };
 
 struct Result {
     Status status = Status::Ok;
@@ -76,14 +84,14 @@ struct LoadRequest {
     std::string diag_dump;            ///< diagnostic: directory for per-layer tensor dumps (empty = off)
     int diag_tier_ram = -1;           ///< diagnostic: fixed RAM-tier experts per layer (-1 = sized from free memory)
     int diag_tier_vram = -1;          ///< diagnostic: fixed VRAM-tier experts per layer (-1 = sized from free memory)
-    std::vector<int> peer_devices;    ///< CUDA devices of the expert tier cards after the main one
+    GpuCards gpus;                    ///< the cards, main first, their mode and shares (multi_gpu.hpp)
     int64_t max_context = 0;          ///< --max-context, or the default every model shares
     int sessions = 1;                 ///< sessions the model will be asked for (--batch)
     bool vision = false;              ///< --vision: requests may carry images (each slot keeps buffers for one)
     std::string expert_profile;       ///< the routing order of the experts (empty: the file's own order)
     int expert_cache = 0;             ///< VRAM expert slots over all layers (0 or -1: from the free memory)
     uint64_t resident_budget = 0;     ///< bytes the RAM tier may take (0: from the free memory)
-    int pool_workers = 0;             ///< CPU pool workers (0: the machine's physical cores)
+    int pool_workers = 0;             ///< CPU pool workers (0: the start-up pick, program::auto_pool_workers)
     kernels::cpu::PoolAffinity pool_affinity = kernels::cpu::PoolAffinity::All;
     bool pool_affinity_given = false;
     int peer_reserve_mib = 600;       ///< VRAM a second card leaves free
@@ -96,6 +104,10 @@ struct LoadRequest {
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
+    RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
+    RouteFlags route;                 ///< the lossy routing flags, for a model that takes them (route_flags.hpp)
+    int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
+    int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
 };
 
 struct DecodeRequest {
@@ -110,6 +122,9 @@ struct DecodeRequest {
     const kernels::SamplerParams* sampling = nullptr;   ///< how next_token is drawn (null: greedy)
     const int32_t* history = nullptr; ///< per row, the last `history_len` tokens the pick follows (host), for the penalties
     int history_len = 0;
+    /// Rows 1 .. n_tokens-1 are the drafts the session's own drafter left last (draft_end), in order. A sampled window may
+    /// then keep each by the drafter's proposal (speculative sampling) instead of comparing it with its own draw.
+    bool drawn_drafts = false;
 };
 
 struct PrefillRequest {
@@ -147,6 +162,14 @@ public:
             if (Result r = sessions[i]->decode_window(reqs[i]); !r.ok()) return r;
         return {};
     }
+    /// After the batch rounds' last decode_batch over sessions[0..n) (this one first; a lone decode_window, n = 1) and before
+    /// any of them drafts: the rows each window keeps (its accepted drafts and the pick after them, fewer where its request
+    /// ended). A model that settles a window's state at once (a verifier that rolls the rejected rows back) does it here;
+    /// the default leaves it to the next window's position.
+    virtual Result decode_kept(ModelSession* const* sessions, const int* kept, int n) {
+        (void) sessions; (void) kept; (void) n;
+        return {};
+    }
     /// Takes the memory the session will hold (expert tiers), so the first request does not wait for it.
     virtual Result prepare() { return {}; }
     /// The prompt is read: workspaces a part kept with `more` go back.
@@ -157,6 +180,13 @@ public:
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.
     virtual int max_window() const { return 1; }
+    /// The most rows a decode window starting at `pos` may hold, so that it ends at a position where the session changes
+    /// state between windows (0: no limit). Only drafted windows are shortened; a row gives the same bits in any window.
+    virtual int window_limit(int64_t pos) const { (void) pos; return 0; }
+    /// For a drafter that sets its windows' length itself (a stop rule in its chain): the rows of the next window over its
+    /// drafts `chance[0..n)` (one plus the drafts it keeps); the draft policy then only weighs a lookup proposal against
+    /// them. 0: the policy picks the length from the drafts' stated chances.
+    virtual int own_window(const float* chance, int n) const { (void) chance; (void) n; return 0; }
     /// Whether the engine may fill a window with prompt-lookup drafts (CommonOptions::suffix_draft) in place of the
     /// drafter's: any window's rows are verified the same way, so only speed changes.
     virtual bool copy_drafts() const { return false; }
@@ -170,14 +200,21 @@ public:
             if (Result r = peers[i]->draft_begin(anchors[i], pos[i], n[i]); !r.ok()) return r;
         return {};
     }
-    /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`.
-    virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n) { (void) ids; (void) conf; (void) max_n; (void) n; return {Status::NotImplemented, "this model has no drafter"}; }
+    /// Whether draft `j` (from 0) of `n` can be in the next window, from the chances of drafts 0..j (the later ones not
+    /// known yet).
+    using DraftNeed = std::function<bool(const float* chance, int j, int n)>;
+    /// The drafts draft_begin started: `n` tokens and each one's estimated chance of acceptance, at most `max_n`. A
+    /// session that makes its drafts in turn may stop before the first draft `need` rules out (when set): no window
+    /// would verify it, so only its time is at stake.
+    virtual Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed& need) { (void) ids; (void) conf; (void) max_n; (void) n; (void) need; return {Status::NotImplemented, "this model has no drafter"}; }
     /// Rows row0..row0+n of the last decoded window: picks[t]'s log probability and the row's `top` likeliest tokens,
     /// kernels::kLogprobStride floats a row to the host `out` (basalt/kernels/logprobs.hpp).
     virtual Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) { (void) row0; (void) n; (void) picks; (void) top; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
     /// The logits of row `row` of the last decoded window (n_vocab floats).
     virtual Result copy_logits(int row, float* out) { (void) row; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
-    /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now.
+    /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now,
+    /// left at -1 by a session with no cache to lend (it answers ok and SLEEP goes on to the driver). Without this the
+    /// model cannot sleep.
     virtual Result set_low_memory(bool low, int64_t& expert_slots) { (void) low; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
     /// What the session leaves free on the main card from now on (`mib` < 0: the start's reserve), through prompts and
     /// images too; its VRAM use is resized to that now. The slots it holds now.
@@ -209,8 +246,22 @@ public:
     /// read from the file.
     struct ExpertCounts { int64_t hits = 0, lookups = 0, offloaded = 0, files = 0; };
     virtual ExpertCounts expert_counts() const { return {}; }
+    /// The experts each GPU holds now (CUDA ordinal, slots, their VRAM bytes); empty without routed experts.
+    struct CardExperts { int device = 0; int64_t slots = 0; uint64_t bytes = 0; };
+    virtual std::vector<CardExperts> experts_by_card() const { return {}; }
+    /// The VRAM the session's KV cache takes on its card now; -1 when the session does not say.
+    virtual int64_t kv_bytes() const { return -1; }
+    /// The server's expert map (core/expert_map.hpp): the sample's pairs of `total`, each one's home (core::ExpertHome) and its
+    /// decode lookups since the last call; the first call starts the counting. False without routed experts.
+    virtual bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+        (void) total; (void) homes; (void) routed;
+        return false;
+    }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
+    /// An elastic KV's ceiling (core/elastic_kv.hpp): the positions the session can back before the expert cache would go below
+    /// the slots a prompt chunk needs; -1 without an elastic KV.
+    virtual int64_t kv_ceiling() { return -1; }
     /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block), and its grid of
     /// merged tokens when the model places rows by it (else {0, 0}). Rows with no vision support leave the default.
     virtual Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows, ImageGrid& grid) {
@@ -235,17 +286,36 @@ public:
     }
 };
 
-/// A loaded model: weights resolved, ready to make sessions.
+/// A model and its sessions.  Its start runs in three steps (ModelAdapter::start): the model's plan, the one pass that
+/// places every byte the plan queued (core::place_start), and the model's attach.
 class LoadedModel {
 public:
     virtual ~LoadedModel() = default;
     virtual const ModelDesc& desc() const = 0;
     /// The context the loaded model runs with, when it sizes that itself (0: the caller's --max-context stands).
     virtual int64_t context() const { return 0; }
-    virtual Result make_session(std::unique_ptr<ModelSession>& out) = 0;
+    /// Everything the model will hold is decided and allocated, in the order its sizing depends on (its weights, then what
+    /// is sized from the memory left: caches, tiers, prompt stages), and every byte it reads is queued in `reads`; no byte
+    /// is placed.  The model makes its req.sessions sessions here, into `sessions`, when what it sizes from the memory left
+    /// must see their state; else in attach().
+    virtual Result plan(const LoadRequest& req, core::LoadPlan& reads, std::vector<std::unique_ptr<ModelSession>>& sessions) = 0;
+    /// Once every queued byte has landed: the model connects what the reads filled (prompt stages, copies made from the
+    /// weights, checks of what was placed) and makes its sessions if plan() did not; they are then ready to run.
+    virtual Result attach(const LoadRequest& req, std::vector<std::unique_ptr<ModelSession>>& sessions) = 0;
+    /// The model's gpu-mode peer (model/peer_hooks.hpp); null for a model that runs no peer.
+    virtual PeerHooks* peer() const { return nullptr; }
+    /// Card `card`'s part of a several-card run once loaded (0 = the main card), for the start line after the load
+    /// (model/multi_gpu.hpp gpu_parts_line): the peer's report when the model has one; empty: nothing to say.
+    virtual std::string gpu_report(int card) const { return peer() ? peer()->peer_report((size_t) card) : std::string(); }
 };
 
-/// The texts of the model's own tokens in the pack's vocabulary: the defaults of --eos-ids, --turn-token, --image-pad-id,
+/// A started model and its sessions.
+struct Started {
+    std::unique_ptr<LoadedModel> model;
+    std::vector<std::unique_ptr<ModelSession>> sessions;
+};
+
+/// The texts of the model's own tokens in the pack's vocabulary (a name may hold one `*` for a suffix that differs between files): the defaults of --eos-ids, --turn-token, --image-pad-id,
 /// and a video group's pad ("" for a model that reads no video).
 struct TokenNames {
     std::vector<std::string> eos;
@@ -267,13 +337,17 @@ public:
     virtual std::string validate(const GgufFile& meta) const = 0;
     /// Geometry from the file's metadata.
     virtual ModelDesc describe(const GgufFile& meta) const = 0;
-    virtual Result load(const LoadRequest& req, std::unique_ptr<LoadedModel>& out) const = 0;
+    /// The model a start runs, before its plan; null for a model with its own start (run()).
+    virtual std::unique_ptr<LoadedModel> make_model() const { return nullptr; }
+    /// The start: the model's plan, the bytes it queued announced as the start's total and placed in one pass, its attach;
+    /// then the load bar ends.
+    Result start(const LoadRequest& req, Started& out) const;
     /// The file names under data/profiles the engine ships for the pack `key` ("<arch>-<layers>x<experts>") names; the
     /// start refuses when one is missing. Empty for a pack the engine ships no profile for.
     virtual std::vector<std::string> shipped_profiles(const std::string& /*key*/) const { return {}; }
     virtual std::vector<SideTableSpec> side_tables(const ModelDesc&) const { return {}; }
     virtual TokenizerSpec tokenizer_spec() const = 0;
-    /// A model with its own start and serving runs them here to the exit code; nullopt: the shared server runs load()'s sessions.
+    /// A model with its own start and serving runs them here to the exit code; nullopt: the shared server runs start()'s sessions.
     virtual std::optional<int> run(program::CommonOptions& o, std::vector<program::GpuCard>& cards) const {
         (void) o; (void) cards;
         return std::nullopt;
@@ -284,18 +358,27 @@ public:
     virtual const char* quality_flags() const { return ""; }
     /// The model's name as a community benchmark row records it; empty for a model that has none.
     virtual const char* model_name() const { return ""; }
+    /// The KV cache format a community benchmark row runs this model with when it takes no int8; empty: its default.
+    virtual const char* community_kv() const { return ""; }
+    /// The quant label of a community row when the pack's name carries none (its name ends in no format word); empty: "unknown".
+    virtual const char* community_quant() const { return ""; }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
     virtual int quality_window() const { return 1; }
-    /// The cards that may hold experts beside the main one.
-    virtual int max_expert_cards() const = 0;
+    /// What the model runs with several cards: the most cards each mode takes, 0 for a mode it does not run.
+    virtual program::GpuModes gpu_modes() const = 0;
     virtual TokenNames token_names() const = 0;
-    /// The pre-tokenizer's name in the pack's tokenizer.json and its rule.
+    /// The pre-tokenizer's name in the pack's tokenizer.json and its rule. `ignore_merges`: a piece that is itself a
+    /// vocabulary entry is that token, not merged from its bytes (Hugging Face BPE's ignore_merges; llama.cpp ties it to
+    /// the pre-tokenizer too).
     struct PreTokenizer {
         const char* name = "";
         void (*split)(const char* text, size_t size, std::vector<size_t>& ends) = nullptr;
+        bool ignore_merges = false;
     };
     virtual PreTokenizer pretokenizer() const = 0;
     virtual program::grammar::ToolForm tool_form() const = 0;
+    /// Where the model's reply holds its thinking, for the grammar guard (the default: a <think> block).
+    virtual program::grammar::ReplyForm reply_form() const { return {}; }
     /// The options object of this model: the common flags and its own.
     virtual std::unique_ptr<program::CommonOptions> make_options() const;
     /// Takes a flag outside the common set; false when this model has no such flag. `code`: an exit code for a bad value.
@@ -313,8 +396,6 @@ void register_adapter(std::unique_ptr<ModelAdapter> a);
 /// Null when no adapter has that architecture.
 const ModelAdapter* find_adapter(const std::string& arch);
 std::vector<std::string> adapter_names();
-/// The most expert cards any registered model takes: a card plan before a model is known.
-int max_expert_cards();
 /// Why no adapter serves `arch`: a Basalt model this build left out (what the build holds and the option that adds
 /// it), or an architecture Basalt does not have.
 std::string unavailable_architecture(const std::string& arch);

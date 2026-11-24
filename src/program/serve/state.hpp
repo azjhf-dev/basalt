@@ -2,12 +2,12 @@
 #pragma once
 
 #include "../cli/tokens.hpp"
+#include "console_stats.hpp"
 #include "basalt/core/checkpoint_transfer.hpp"
 #include "basalt/core/conversation_cache.hpp"
 #include "basalt/core/conversation_memory.hpp"
 #include "basalt/core/conversation_store.hpp"
 #include "basalt/core/device.hpp"
-#include "basalt/core/draft_cum.hpp"
 #include "basalt/core/logit_bias.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/core/progress.hpp"
@@ -67,6 +67,8 @@ void stall_report(std::FILE* f, uint64_t layers_during);
 
 enum class Flow { proceed, next, quit, error };
 
+struct SlotWin;
+
 // Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
 // a driver that pages GPU memory do so, and a graph spinning on a host flag then never finishes.  A driver that
 // fails such an allocation instead needs room only for what is allocated after loading (lazily loaded kernels, graphs,
@@ -102,10 +104,7 @@ public:
     basalt::model::ModelAdapter::PreTokenizer pre_{};
     static constexpr int kPenaltyWindowCap = 4096;
     // ---- what a model answers: one call per batch window at most, the rest per command or per request
-    virtual bool windows_in_flight() = 0;
     virtual bool next_batch_window() = 0;
-    virtual bool drain_windows() = 0;
-    virtual void script_command(const std::string& line) = 0;
     virtual void probe_command(const std::string& line, std::string& e) = 0;
     virtual bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr) = 0;
     virtual void sleep_command(bool down, std::string& e) = 0;
@@ -128,7 +127,6 @@ public:
     /// From READY on the RAM guard watches MemAvailable against the reserve (--ram-reserve-mib); with 0 it never
     /// starts. The disk tier keeps a GiB above that floor either way.
     void start_guard();
-    virtual bool pipelined() const { return false; }   // batch groups pipelined through layer split stages
     virtual int64_t slot_context(int slot) const = 0;
     virtual bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) = 0;
     virtual bool slots_share_cells() const { return true; }   // one slot's positional state can be copied to another
@@ -137,6 +135,36 @@ public:
     virtual size_t spill_to_disk(bool at_exit, size_t limit) = 0;
     virtual bool park_idle_engine(std::string& e) = 0;
     virtual void kv_ceiling_note() {}   // a model with an elastic KV sends its ceiling again when it moves
+    // ---- the console's figures (console_stats.hpp), once the server sends STATS
+    ConsoleStats stats{};
+    /// The model's expert counts so far (none for a dense model).
+    virtual LookupCounts lookup_counts() { return {}; }
+    /// The expert map's sample: the pairs of all, each one's home and its lookups since the last call. False for a model
+    /// without routed experts. The first call starts the counting.
+    virtual bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
+        (void) total; (void) homes; (void) routed;
+        return false;
+    }
+    /// Per card (CUDA ordinal): the experts it holds and the VRAM their slots take, the KV cache's VRAM (-1: not known), and
+    /// the host-to-device bandwidth as the start measured it (0: not measured). Sent as
+    /// `INFO cards=<bus id>/<expert slots>/<GB/s or ->/<expert MiB>/<KV MiB or ->;...` whenever it changes.
+    struct CardFacts {
+        int device = 0;
+        int64_t expert_slots = 0;
+        double h2d_gbps = 0;
+        uint64_t expert_bytes = 0;
+        int64_t kv_bytes = -1;
+    };
+    virtual std::vector<CardFacts> card_facts() { return {}; }
+    std::string cards_sent_{};
+    /// A decode window of `slot` (see ConsoleStats::window); around a window or a batch round, its lookups.
+    void stats_window(int slot, int offered, int accepted, int tokens) {
+        if (stats.on) stats.window(slot, offered, accepted, tokens);
+    }
+    void stats_lookups_begin() { if (stats.on) stats.lookups_begin(lookup_counts()); }
+    void stats_lookups_end() { if (stats.on) stats.lookups_end(lookup_counts()); }
+    /// Writes the XSLOT and XMAP lines when due (`force`: now, as a request ends).
+    void stats_tick(bool force = false);
     basalt::program::CommonOptions& o;
     basalt::core::ModelFile& model_file;
     std::string& err;
@@ -156,6 +184,9 @@ public:
     std::vector<ConvCheckpoint> checks{};
     /// The checkpoint save in flight (see ckd_finish).  Declared after `checks`: its wait runs before their bytes are freed.
     basalt::core::CheckpointDeferral ckd{};
+    /// A model split across two cards: the second card's part of that save, on its device.
+    basalt::core::CheckpointDeferral ckd_peer{};
+    int ckd_peer_dev = -1;
     /// A checkpoint of `to` tokens already in the chain is used again (and keeps the higher `source`): true.
     bool touch_check(int64_t to, ConvCheckpoint::Source source);
     /// Adds a checkpoint to the chain; the least recently used one goes first past --prompt-cache.
@@ -183,9 +214,37 @@ public:
     // GENT: the request text arrives as bytes and the reader thread turns it into ids, from the pack's tokenizer tables
     basalt::program::Tokenizer text_tokenizer{};
     std::string text_tokenizer_note{};
+    /// The raw bytes a token stands for; empty when the pack's tokenizer tables are not loaded or the id has none.
+    std::string_view token_bytes(int32_t id) const {
+        return !text_tokenizer_note.empty() || id < 0 || (size_t) id >= text_tokenizer.vocab_size()
+                   ? std::string_view() : std::string_view(text_tokenizer.token_bytes(id));
+    }
     std::mutex gent_mu{};
     std::map<uint64_t, std::vector<int32_t>> gent_ids{};   // tokenized prompts waiting for their request line, by sequence
     uint64_t gent_seq{};
+    // ---- --batch: a prompt the server sends once (`PROMPT`: text the engine tokenizes, `PROMPTI`: ids) and then names by
+    // handle (`#<handle>[+<id>,...]` where a GEN line has its ids), so a request that runs in several engine runs or
+    // waits for a slot does not send or tokenize it again.  The input thread takes it in and answers `PROMPT <handle>
+    // <n>` at once, even while a request runs; `PMATCH <handle>` then says what each idle slot holds of it.  Guarded by gent_mu.
+    struct HeldPrompt {
+        std::vector<int32_t> ids;
+        bool media = false;   ///< its pictures are placed by the request that reads it: a held conversation meets it only as an exact prefix
+    };
+    std::map<uint64_t, HeldPrompt> prompts{};
+    static constexpr size_t kPromptsMax = 64;
+    /// The tokens an idle slot's conversation holds for its next turn; null when it holds none (or is decoding).
+    const std::vector<int32_t>* idle_ids(int b) const;
+    struct SlotMeet {
+        int64_t match = 0;   ///< the tokens of the prompt the slot's conversation continues (another conversation sharing a head: 0)
+        int64_t held = 0;    ///< the tokens it holds
+    };
+    std::vector<SlotMeet> slot_meets(const std::vector<int32_t>& prompt, bool media) const;
+    /// Holds a prompt and returns its handle.
+    uint64_t hold_prompt(HeldPrompt&& p);
+    /// PROMPTI [img] <id,id,...>, from the input thread: held and answered.
+    void take_prompt_ids(const std::string& line);
+    /// PMATCH <handle> | PFREE <handle>, from the main loop.
+    void prompt_command(const std::string& line);
     std::atomic<bool> stop_req{};
     std::atomic<bool> stdin_lost{};
     std::thread reader_{};
@@ -225,32 +284,37 @@ public:
         // `chunk`: the chunk of a read beside decoding slots, whose rest is read beside them in it, else 0)
         bool partial = false, partial_from0 = false;
         int64_t partial_chunk = 0;
-        // BSCRIPT (a test drive of the multi-token segments): the tokens this slot's request is known to produce
-        // (script[0] is its first token); the windows draft from it, some drafts wrong, and keep what matches
-        std::vector<int32_t> script;
-        std::mt19937_64 rng;
         // the request's grammar (the batch windows' form of the solo loop's `gguard`): the window's kept picks are
         // scanned, the first refused one is resampled under the mask, and the segment ends there
         std::unique_ptr<basalt::program::grammar::Guard> guard;
         int lp_top = -1;   ///< the request's logprobs=K: a BP line ahead of the BT line for every kept pick (-1: off)
-        // the MTP drafter's side of the slot (the draft K/V is the drafter's store of the same index): the drafts and
-        // their probabilities for the slot's next window, the request's draft-length rule state, its prompt-lookup
-        // history and last proposal
+        // the drafter's side of the slot: the drafts its session left for the slot's next window and their chances, its
+        // prompt-lookup history and last proposal
         int32_t dr[basalt::spec::DraftPolicy::kMaxT] = {};
         float dprob[basalt::spec::DraftPolicy::kMaxT] = {};
         int n_dr = 0;
-        basalt::core::DraftCumAdapt cum;
         std::unique_ptr<basalt::spec::SuffixDrafter> sfx;
         int32_t sbuf[basalt::spec::DraftPolicy::kMaxT] = {};
-        int sk = 0, smatch = 0;
         int pen_n = 0;                 ///< the request's penalty window (penalty_last_n; 0: no penalties)
-        bool from_sfx = false;
-        double acc = 0.6;          ///< drafts accepted per offered, smoothed: who gets the free rows
-        int64_t since_draft = 0;   ///< windows since the slot last drafted
-        int64_t windows = 0;
+        int64_t windows = 0;   ///< the request's windows in this slot, for BDONE
         int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
     };
     std::vector<BSlot> bs{};
+    // ---- --batch: the slots' rounds (batch_round.cpp), the same for every model
+    /// The session slot `b` decodes in.
+    virtual basalt::model::ModelSession& slot_session(int b) = 0;
+    /// False while active slot `b` sits out the next round (its model cannot run its window yet); it keeps its place.
+    virtual bool slot_ready(int b) { (void) b; return true; }
+    /// One window of every ready active slot: the windows share batch_rows() rows, each group runs as one batch
+    /// (decode_batch) or a lone window (decode_window), then every slot takes its tokens and drafts its next window.
+    bool batch_round();
+    /// The batch windows' draft policy, which the runtime sets up, and each slot's sampling (slot_set_sampling).
+    std::optional<basalt::spec::DraftPolicy> bpolicy{};
+    std::vector<basalt::kernels::SamplerParams> slot_sampling{};
+    void slot_window_begin(int b, SlotWin& w, int limit);
+    bool slot_window_finish(int b, SlotWin& w);
+    bool slot_window_accept(int b, SlotWin& w);
+    bool slot_window_end(int b, SlotWin& w);
     // ---- idle conversations out of VRAM.  An idle conversation (a cached batch slot's, or the solo session's while
     // no request works there) keeps its KV in VRAM until the work beside it has run kParkAfterBusy seconds: the
     // expert-cache slots its cells hold have then cost that work about what moving it out and back costs, both

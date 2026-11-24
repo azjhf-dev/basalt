@@ -1,6 +1,8 @@
 // src/program/serve/runtime.cpp - lifecycle of the persistent engine.
 #include "state.hpp"
 
+#include "basalt/core/on_device.hpp"
+
 namespace basalt::program::serve {
 
 void Runtime::start_guard() {
@@ -45,7 +47,12 @@ void Runtime::ckd_finish() {
     const void* dst = ckd.pending();
     if (dst == nullptr) return;
     std::string ce;
-    if (ckd.finish(ce)) return;
+    bool ok = ckd.finish(ce);
+    if (ckd_peer.pending()) {
+        const basalt::core::OnDevice on(ckd_peer_dev);
+        ok = ckd_peer.finish(ce) && ok;
+    }
+    if (ok) return;
     basalt::log::error("basalt serve", "%s", ce.c_str());
     checks.erase(std::remove_if(checks.begin(), checks.end(),
                                 [&](const ConvCheckpoint& k) { return k.state_a.data() == dst; }), checks.end());
@@ -114,6 +121,11 @@ bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey
 }
 
 int Runtime::shutdown() {
+    if (basalt::core::gpu_left_running().load()) {   // the teardown would wait for unconfirmed GPU work forever
+        basalt::log::error("basalt serve", "the GPU did not confirm earlier work: ending without the CUDA teardown");
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
     // the conversations this process holds go to the disk tier before it ends
     if (disk.enabled()) {
         const auto t0 = Clock::now();

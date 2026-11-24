@@ -99,7 +99,7 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
                       : "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
         return false;
     }
-    if (peer.valid() && !for_sleep) { e = "VRAM: not with a second GPU as expert tier"; return false; }
+    if (peer.valid() && !for_sleep) { e = "VRAM: not with a peer card (gpu-mode peer)"; return false; }
     for (const PfPart& p : pf_parts)
         if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
     if (!ver.wait_commit(e)) return false;
@@ -213,7 +213,7 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
     char line[400];
     std::snprintf(line, sizeof line, "VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld "
                   "expert_cache_mib=%lld expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld "
-                  "ram_homes_mib=%lld\n", reserve, (long long) xcache.slots(), (long long) xcache.full_slots(),
+                  "ram_homes_mib=%lld\n", reserve, (long long) gpu_slots(), (long long) xcache.full_slots(),
                   (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
                   (long long) (free_b >> 20), (long long) o.prefill_chunk, (long long) (src.homes_bytes() >> 20));
     if (reply != nullptr) *reply = line;

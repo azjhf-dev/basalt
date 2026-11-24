@@ -1,0 +1,41 @@
+{
+  "source_repository": "https://github.com/xyehya/basalt",
+  "source_branch": "inkling2-5080-setup",
+  "source_sha": "3fdb44e9314abd4007fa0112ddd46e7fe2b40040",
+  "baseline_sha": "cea3989c11e7314acc8d0c1c4393c0a7b47dabe6",
+  "fork_parent_sha": "e9db1aeabdc190f4e6ba2ed058ea55219e360fbc",
+  "protected_qfn_sha": "94d06f7a0bba070f9ca00530fd4751a2dff0aaed",
+  "snapshot_exception": "Preserve existing fork main .github/workflows unchanged; no workflow token scope",
+  "prs": {
+    "649": {
+      "url": "https://github.com/jesdga95/basalt/pull/649",
+      "state": "open",
+      "merged": false,
+      "head_sha": "542879447c65b55429a40ae9e1c3a33b276c5d69"
+    },
+    "650": {
+      "url": "https://github.com/jesdga95/basalt/pull/650",
+      "state": "open",
+      "merged": false,
+      "head_sha": "6184401455ac1be49602be6d27b5cfe468207466"
+    },
+    "609": {
+      "url": "https://github.com/jesdga95/basalt/pull/609",
+      "state": "open",
+      "merged": false,
+      "head_sha": "c98c7c2ba0f27370d3917c4b130736dcb2728e68"
+    },
+    "606": {
+      "url": "https://github.com/jesdga95/basalt/pull/606",
+      "state": "open",
+      "merged": false,
+      "head_sha": "5bd80b0f9cacd8b63189945249d2d1ce5080935f"
+    },
+    "636": {
+      "url": "https://github.com/jesdga95/basalt/pull/636",
+      "state": "open",
+      "merged": false,
+      "head_sha": "a22f6d9f8adb4c229da9947109a3ddae79a5a80b"
+    }
+  }
+}

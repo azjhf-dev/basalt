@@ -22,12 +22,13 @@ int token_path(Context& context) {
     auto& srcp = *context.srcp;
     auto& xcache = *context.xcache;
 
-    // ---- Multi-GPU: the second GPU's expert tier (filled after the RAM complement below, from it), and the further
-    // cards' tiers beside it
+    // ---- gpu-mode peer: an expert tier on each card after the main one (filled after the RAM complement below, from it),
+    // opened by the shared driver (TierPeers, model::PeerHooks)
     basalt::core::PeerExperts peer;
     std::vector<std::unique_ptr<basalt::core::PeerExperts>> xpeers;
+    TierPeers peers(peer, xpeers);
     if (o.peer_device >= 1 && (profile.empty() || srcp == nullptr || o.expert_cache <= 0)) {
-        basalt::log::error("basalt generate", "a second GPU as expert tier needs an expert profile and the expert cache; run on one GPU (--gpu 0)");
+        basalt::log::error("basalt generate", "a peer card (gpu-mode peer) needs an expert profile and the expert cache; run on one GPU (--gpu 0)");
         return 1;
     }
 
@@ -306,6 +307,7 @@ int token_path(Context& context) {
 
     context.peer = &peer;
     context.xpeers = &xpeers;
+    context.peers = &peers;
     context.drive = &drive;
     context.routing = &routing;
     context.gr = &gr;

@@ -1,0 +1,42 @@
+[
+  {
+    "test": "inkling2_spill",
+    "compile": 0,
+    "run": 0
+  },
+  {
+    "test": "inkling2_copy_heat",
+    "compile": 0,
+    "run": 0
+  },
+  {
+    "test": "inkling2_loan_layout",
+    "compile": 0,
+    "run": 0
+  },
+  {
+    "test": "inkling2_expert_map",
+    "compile": 0,
+    "run": 0
+  },
+  {
+    "test": "tier_policy",
+    "compile": 0,
+    "run": 0
+  },
+  {
+    "test": "chunk_plan",
+    "compile": 0,
+    "run": 0
+  },
+  {
+    "test": "multi_gpu",
+    "compile": 0,
+    "run": 0
+  },
+  {
+    "test": "gpu_check",
+    "compile": 0,
+    "run": 0
+  }
+]

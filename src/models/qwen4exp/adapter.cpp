@@ -1,6 +1,7 @@
 // Flash-Next adapter. Decode, prefill and the drafter stay on the engine's own paths (core/verify, prefill,
 // mtp); this adapter owns the architecture guard, the geometry and the side-table/tokenizer descriptions.
 #include "models/qwen4exp/adapter.hpp"
+#include "models/qwen4exp/load/engine_local.hpp"
 #include "models/qwen4exp/meta.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
@@ -24,15 +25,12 @@ public:
 
     model::ModelDesc describe(const GgufFile& g) const override { return describe_meta(g); }
 
-    model::Result load(const model::LoadRequest&, std::unique_ptr<model::LoadedModel>&) const override {
-        return {model::Status::NotImplemented, "Flash-Next runs its own start"};
-    }
-
     std::optional<int> run(program::CommonOptions& o, std::vector<program::GpuCard>& cards) const override {
         return run_engine(static_cast<Options&>(o), cards);
     }
 
-    int max_expert_cards() const override { return kernels::kDmMaxX; }
+    // peer: the main card, kDmMaxX peers with their own rings and one more; split: one stage per card (SplitDrive)
+    program::GpuModes gpu_modes() const override { return {kernels::kDmMaxX + 2, engine_local::SplitDrive::kMax, 0, true}; }
 
     // pinned tiers; without --resident-experts a pack larger than free RAM is refused
     const char* quality_flags() const override { return "--spec 5 --adapt-swaps 0 --peer-adapt-swaps 0 --resident-experts"; }

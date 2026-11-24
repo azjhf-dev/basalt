@@ -1,6 +1,7 @@
 // src/kernels/cuda/elementwise.cu - the glue kernels.  See the header for why each exists.
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/dp4a.hpp"
+#include "basalt/kernels/doorbell.cuh"
 
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/f16_bits.hpp"
@@ -196,6 +197,16 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream) 
     check_launch("doorbell_wait");
 }
 
+__global__ void doorbell_abort_wait_kernel(const uint32_t* flag, const uint32_t* seq, const uint32_t* abort) {
+    doorbell_spin(flag, *seq, abort, 1);
+}
+
+void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, const uint32_t* d_abort, void* stream) {
+    if (d_flag == nullptr || d_seq == nullptr) return;
+    doorbell_abort_wait_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_flag, d_seq, d_abort);
+    check_launch("doorbell_wait");
+}
+
 __global__ void wait_word_kernel(const volatile uint32_t* word, uint32_t value) {
     while (*word != value) spin_pause();
     __threadfence_system();
@@ -204,6 +215,27 @@ __global__ void wait_word_kernel(const volatile uint32_t* word, uint32_t value) 
 void wait_word(const uint32_t* word, uint32_t value, void* stream) {
     wait_word_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(word, value);
     check_launch("wait_word");
+}
+
+__global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
+    while (*flag < value) spin_pause();
+    __threadfence_system();
+}
+
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
+    wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check_launch("wait_flag_ge");
+}
+
+__global__ void signal_flag_kernel(volatile uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *flag = value;
+    __threadfence_system();
+}
+
+void signal_flag(uint32_t* flag, uint32_t value, void* stream) {
+    signal_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check_launch("signal_flag");
 }
 
 __global__ void copy_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t n4) {

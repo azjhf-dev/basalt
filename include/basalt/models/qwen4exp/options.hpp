@@ -7,26 +7,11 @@
 namespace basalt::models::qwen4exp {
 
 struct Options : CommonOptions {
-    /// THE CONTEXT EXTENSION (rope scaling, rope_scaling.hpp).  These knobs resolve to ONE process config,
-    /// set once before `session_init` builds the rope table and the graphs capture the kernels.  There is
-    /// deliberately no per-request form: K sits in the cache POST-RoPE, so one cache must never mix two
-    /// scalings.  Precedence: an EXPLICIT flag over the model file's rope keys over the struct defaults -
-    /// `none` and `1` are explicit values (the opt-outs), the absent flag is not.
-    std::string rope_scaling;           ///< --rope-scaling none|linear|yarn (llama.cpp's names); empty = the flag is absent
-    double rope_scale = 0;              ///< --rope-scale F: the extension factor; 0 = the flag is absent (the model file's, else 1 = off)
-    double rope_freq_base = 0;          ///< --rope-freq-base N: 0 = the model's (1e7)
-    double rope_freq_scale = 0;         ///< --rope-freq-scale F: the raw ggml knob; 0 = 1/--rope-scale
-    double yarn_orig_ctx = 0;           ///< --yarn-orig-ctx N: 0 = the model's, else 262144
-    double yarn_ext_factor = -1.0;      ///< --yarn-ext-factor F: <0 = auto (1 for yarn, 0 otherwise)
-    double yarn_attn_factor = 1.0;      ///< --yarn-attn-factor F
-    double yarn_beta_fast = 32.0;       ///< --yarn-beta-fast F
-    double yarn_beta_slow = 1.0;        ///< --yarn-beta-slow F
     /// How the n-gram table is read.  Direct (default) = unbuffered SSD reads, table never in RAM.
     std::string ple_io = "direct";
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
     int ple_inflight = 256;   // the prompt path reads a chunk's rows at once, so the SSD stays busy
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
-    int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the large GEMV does not.
@@ -55,12 +40,9 @@ struct Options : CommonOptions {
     uint64_t resident_headroom = 8ull << 30;
     bool resident_soft = false;
     bool resident_cpu_explicit = false;   // --resident-cpu-experts given by itself (not only implied)
-    int64_t peer_slots = 0;
     int peer_adapt_swaps = -1;
     /// The peer's experts are held only on the peer, not also in the RAM complement (needs --resident-experts).
     bool peer_exclusive = false;
-    /// --no-peer-prefill: the prompt path stays on the primary, the peer computes none of its rows
-    bool no_peer_prefill = false;
     /// --serve (opt-in): where to save what the adaptive tier learned, as a profile (the resident experts first,
     /// then the routing counted since the start; the format of data/profiles); on QUIT and every
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
@@ -95,23 +77,10 @@ struct Options : CommonOptions {
     /// own draw differs (0 = exact; the flag alone = kRelaxedDraftingDefault).  This changes the output distribution:
     /// docs/precision/qwen38-flash-next.md#relaxed-drafting.  Solo decode only; a request's relax=P key overrides it.
     float relaxed_drafting = 0.0f;
-    /// --route-tail-skip [R]: in a decode window an expert no GPU holds is neither copied nor computed when every
-    /// entry of the window that names it ranks R or lower by router weight (0 = off; the flag alone =
-    /// kRouteTailSkipDefault).  The others keep their router weights.  This changes the output:
-    /// docs/precision/qwen38-flash-next.md#lossy-routing-flags.
-    int route_tail_skip = 0;
-    /// --route-prior [LAMBDA]: a decode window picks its top-10 as if every expert a GPU holds had LAMBDA added to its
-    /// router logit; the weights stay the router's own (0 = off; the flag alone = kRoutePriorDefault). This changes
-    /// the output:
-    /// docs/precision/qwen38-flash-next.md#lossy-routing-flags.
-    float route_prior = 0.0f;
     /// Never relaxed: the added tokens (control and tool tags, ids from relax_special_from on) and every token
     /// between the tool-call tags, so tool calls are sampled exactly.
     int64_t relax_special_from = 248044;
     int64_t relax_call_open = 248058, relax_call_close = 248059;
-    /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k
-    /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
-    int batch_groups = 1;
     int spec_corrupt = 0;         // --spec-corrupt N > 0 replaces every Nth draft with a wrong token
     /// Names the model's draft layer when it has one (the file); empty means no drafter.
     std::string mtp;
@@ -127,12 +96,14 @@ struct Options : CommonOptions {
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     bool adapt_decay_set = false;
     double prefill_cpu_share = 0.6;   ///< the share of the streamed prompt experts the CPU computes (--prefill-cpu-share)
-    /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
-    /// from each GPU's free VRAM); empty = one GPU
-    std::string layer_split;
-    /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
-    /// GPU, sharing everything - the bit-exact A/B of the hand-off)
-    std::string split_device;
+    /// --diag-fixed-experts: every expert row runs the same way whatever the cards hold: a prompt's on the GPU (the
+    /// missed experts read over PCIe, no CPU share), a window's on the CPU pool (the windows see no expert in VRAM), so
+    /// placements that differ (a split and its reference on one card) compute the same rows
+    bool diag_fixed_experts = false;
+    /// gpu-mode peer: the expert tier's cards after the main one (the first is `peer_device`; -1 and empty: none), from
+    /// the run's cards (CommonOptions::gpus)
+    int peer_device = -1;
+    std::vector<int> peer_devices;
     /// The most experts one adaptive round swaps into the main card's tier; a saturated pipeline (see `kSatBoost`) may
     /// swap `kSatBoost` times as many.
     int adapt_swaps = 96;

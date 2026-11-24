@@ -10,6 +10,7 @@
 #pragma once
 
 #include "basalt/core/model_file.hpp"
+#include "basalt/model/multi_gpu.hpp"
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gdn_window.hpp"
 #include "basalt/model/adapter.hpp"
@@ -25,12 +26,14 @@ enum class Mixer { Gdn, Attention };
 
 /// One projection: `rows` outputs of `cols` inputs, ggml blocks of `type` (Q8_0 8, NVFP4 40, F8_E4M3 44: one E4M3 code
 /// per value, rows of `cols` bytes) on the device; `scale` an NVFP4 or F8 matrix's fp32 tensor scale (device), null for 1.
-/// An NVFP4 product leaves the scale to the step after it; an F8 product applies it itself.
+/// An NVFP4 product leaves the scale to the step after it; an F8 product applies it itself.  The head alone may be F8
+/// with a scale per row (`row_scales`, fp32 [rows] on the device, `scale` then null): it runs on the window gemm only.
 struct Linear {
     int type = -1;
     const void* w = nullptr;
     int64_t rows = 0, cols = 0;
     const float* scale = nullptr;
+    const float* row_scales = nullptr;
 };
 
 struct Layer {
@@ -116,6 +119,16 @@ struct Options {
     uint64_t gpu_weight_bytes = 0;      ///< the weights the adapter put on the main card (its "GiB on the GPU" load figure, no KV cache)
     bool vision = false;                ///< requests may carry images
     bool kv_int8 = false;               ///< the attention layers' K/V as int8 codes with a scale per 64 values
+    bool kv_fp4 = false;                ///< with kv_int8: NVFP4 codes in those buffers instead (kernels::KvInt8::fp4)
+    /// The cache format the size helpers take: 0 fp16, 1 int8, 2 NVFP4.
+    int kv_format() const { return kv_fp4 ? 2 : kv_int8 ? 1 : 0; }
+    /// K/V streaming: each attention layer keeps its first kv_resident cells on the card and the rest in page-locked RAM,
+    /// read over the bus by every decode window and staged to the card for each prompt chunk (0, or at least max_context:
+    /// all on the card)
+    int64_t kv_resident = 0;
+    /// The layers this card holds and runs, [layer_begin, layer_end) (layer_end 0: to the last); its sessions keep the cells
+    /// and recurrent state of those layers only.
+    int layer_begin = 0, layer_end = 0;
     core::FileRange mmproj;             ///< the vision projector (vision/mmproj)
     std::string arch;                   ///< the architecture name, for messages
 };
@@ -131,10 +144,49 @@ using ModelPtr = std::unique_ptr<Model, ModelDeleter>;
 /// Sessions run one after another on the serving thread; each call leaves its stream idle. The decode windows of several
 /// sessions (at most kWindow rows in all) run as one batch through `ModelSession::decode_batch`.
 ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::string& err);
+/// Once the weights have landed (make_model takes them still to be read): the forms decode windows read made from them
+/// (the block drafter's planes and copies).
+bool attach_drafter(Model& m, std::string& err);
 std::unique_ptr<model::ModelSession> make_session(Model& m, std::string& err);
-/// Device bytes one session takes (its KV cells, recurrent states and window rows).
-uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, bool kv_int8 = false);
-/// Device bytes the model's shared scratch takes.
-uint64_t shared_bytes(const Geometry& g, int64_t max_context);
+/// Layers a prompt split's card may hold (the last ones): the most its share's cut puts there.
+constexpr int kPromptSplitLayers = 20;
+/// The prompt split: CUDA device `dev` reads layers [l_min, n_layers) of long prompts' chunks while the main card reads the
+/// next chunk's first layers.  `w` holds the weights of those layers on `dev` (the others empty), still to be read.
+/// Allocates the stage (its session, buffers and hand-off memory); called with the main card current, before any session
+/// is made.  True with no stage when the context is too short for one.
+bool plan_prompt_split(Model& m, int dev, int l_min, const Weights& w, std::string& err);
+/// Once the stage's weights have landed: one chunk of zero rows through its layers, so that its kernels are loaded before the first
+/// prompt reads them (a lazily loaded kernel stalls the main card's queue).  Its state is left empty.  True with no stage.
+bool warm_prompt_split(Model& m, std::string& err);
+/// The layer split: CUDA device `dev` holds layers [cut, n) of `w` (their weights already on `dev`, the others empty) with
+/// their cells and recurrent state, and runs them in every decode window and prompt chunk of `m`, which holds layers
+/// [0, cut).  The second card plans its products as the main card, so the output is the main card's alone to the bit.
+/// Called with the main card current, before any session is made.
+bool attach_split(Model& m, int dev, int cut, const Weights& w, std::string& err);
+/// Main-card bytes a second card's stage keeps (its hand-off buffers and the drafter features it holds back).
+uint64_t stage_main_bytes(const Geometry& g, const BlockDrafter& drafter);
+/// Main-card bytes a prompt split keeps (its hand-off buffers and the drafter features it holds back); 0 when a context of
+/// `max_context` cells is too short for one.
+uint64_t prompt_split_main_bytes(const Geometry& g, const BlockDrafter& drafter, int64_t max_context);
+/// The cells of each attention layer a session keeps on the card (kv_resident's rule).
+int64_t resident_cells(int64_t max_context, int64_t kv_resident);
+/// Device bytes one session takes (its KV cells on the card, recurrent states and window rows) on a card that holds layers
+/// [lb, le) (le 0: to the last); the logits and the drafter's state on the card that holds layer 0.
+uint64_t session_bytes(const Geometry& g, int64_t max_context, bool mtp, int kv = 0, int64_t kv_resident = 0, int lb = 0,
+                       int le = 0);
+/// Device bytes one session's cells and recurrent state take in layer `il`.
+uint64_t session_layer_bytes(const Geometry& g, int il, int64_t max_context, int kv, int64_t kv_resident);
+/// Page-locked host bytes one session's streamed K/V takes (0 without streaming).
+uint64_t session_host_bytes(const Geometry& g, int64_t max_context, int kv, int64_t kv_resident);
+/// Device bytes the model's shared scratch takes (with streaming, the VRAM copy a prompt chunk reads one layer's far cells from).
+uint64_t shared_bytes(const Geometry& g, int64_t max_context, int kv = 0, int64_t kv_resident = 0);
+/// Device bytes a session's block drafter keeps (its context ring and its window rows); 0 without one.
+uint64_t block_session_bytes(const Geometry& g, const BlockDrafter& bd);
+/// What a two-card layer split divides for `o` (its sessions, context and drafter): per layer its weights (`layer_weights`)
+/// and every slot's cells and state there; per card what it holds whatever its layers: the main card `main_weights` (head,
+/// norms, drafter), the shared scratch, each slot's rest and the hand-off buffers, the second card its scratch and landing
+/// residuals. The rooms are the caller's.
+model::SplitSpec split_spec(const Geometry& g, const Options& o, const BlockDrafter& bd, const std::vector<uint64_t>& layer_weights,
+                            uint64_t main_weights);
 
 }  // namespace basalt::dense

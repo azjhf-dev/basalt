@@ -45,7 +45,8 @@ struct Workspace {
     std::size_t partial_floats = 0, tickets_n = 0;
 };
 
-/// One matrix of a call: W [rows][K], its output y[t * ld_y + r], `scale` a device fp32 scalar or null.
+/// One matrix of a call: W [rows][K], its output y[t * ld_y + r], `scale` a device fp32 scalar or null; an F8 matrix may
+/// instead have a scale per row (`row_scales`, fp32 [rows], `scale` then unused).
 struct Matrix {
     const uint8_t* w = nullptr;
     int64_t rows = 0;
@@ -55,6 +56,7 @@ struct Matrix {
     const uint8_t* scales = nullptr;   // NVFP4, Q8: the scale plane when `rows` are the first rows of a larger matrix (null: after
                                        // the codes of these rows)
     uint16_t* y16 = nullptr;           // AddBf16: the BF16 rows added into (y unused)
+    const float* row_scales = nullptr; // F8: row r's scale row_scales[r] in place of `scale`
 };
 
 enum class Epilogue {
@@ -76,7 +78,11 @@ struct Call {
     void* act_out = nullptr;   // SwiGLU: h also as bf16 rows for the next product ([16][rows], act_bytes(rows)); m[0].y may be null
 };
 
-/// The workspace a call needs (its shape only).
+/// The device whose SM count plans every call (its K slices, so its rounding); -1 (the default): the current one.  A card
+/// that runs some of the main card's layers plans as the main card, so its rows are the main card's.
+void plan_device(int device);
+
+/// The workspace a call needs (its shape and the planning device).
 void workspace_need(const Call& c, std::size_t& partial_floats, std::size_t& tickets);
 
 /// Runs the call for rows 0..T-1 (1..16) of `act` (packed for c.K).  F8: K a multiple of 128, W 16-byte aligned.  NVFP4:

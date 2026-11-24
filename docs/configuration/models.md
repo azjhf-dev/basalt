@@ -8,9 +8,9 @@ and starts the next.
   "version": 2,
   "engine": { "conversation-cache-disk-mib": 32768, "idle-sleep": 300, "vram-reserve-mib": 500 },
   "models": [
-    { "alias": "Flash-Next", "model": "flash-next.basalt", "gpu": "auto", "kv": "int8", "max-context": 262144, "parallel": 4,
+    { "alias": "Flash-Next", "model": "flash-next.basalt", "gpu": "all", "gpu-mode": "peer", "kv": "int8", "max-context": 262144, "parallel": 4,
       "slot-full-context": true, "vision": "dynamic" },
-    { "alias": "DeepSeek", "model": "deepseek.basalt", "gpu": "auto", "max-context": 1048576, "vision": "dynamic" }
+    { "alias": "DeepSeek", "model": "deepseek.basalt", "gpu": "all", "gpu-mode": "peer", "max-context": 1048576, "vision": "dynamic" }
   ],
   "server": { "host": "127.0.0.1", "port": 8080 }
 }
@@ -19,7 +19,7 @@ and starts the next.
 - `models`: each entry has a `model` (relative to the file) and an optional `alias`, the name the API reports.
 - `engine`: applies to every model that takes it. An entry's own value wins.
 - `server`: shared by the whole server: `host`, `port`, `allowed-host`, `cors-origin`, `image-url-host`, `image-dir`,
-  `image-remote-only`, `lazy`, `open`, `debug`, `request-lines`.
+  `image-remote-only`, `max-payload-mib`, `lazy`, `open`, `debug`, `request-lines`.
 - An entry takes engine flags and these server options: `gpu`, `vision`, `parallel`, `slot-full-context`, `idle-sleep`,
   `idle-unload`, `min-free-vram-mib`, `fit-max-tokens`, `grammar`, `video-max-tokens`, the reasoning settings and the sampling
   defaults.
@@ -41,8 +41,9 @@ directory, stop the start too.
 
 ## Requests and turns
 
-A request's `model` is the alias or the file's name on every API. Any other name is a 404. `/v1/models` shows `loaded`, `loading`,
-`unloaded` or `failed`.
+A request's `model` is the alias or the file's name on every API. Any other name is a 404, and so is no name at all while several
+models are configured. With one model configured, a request may leave `model` out or send it as null and that model answers.
+`/v1/models` shows `loaded`, `loading`, `unloaded` or `failed`.
 
 Clients wait through a swap; they do not get a 503 for it. A streamed response sends keep-alive comments every 10 s while it waits.
 

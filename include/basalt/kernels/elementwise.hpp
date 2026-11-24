@@ -86,9 +86,17 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
 /// nodes that follow.  Captured once per layer between `pre[l]` and the parts copy; it is what lets one graph
 /// hold the whole token (a handoff needs no driver call).
 void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream);
+/// Wait for sequence equality or a set abort word. A null abort word disables the abort check.
+void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, const uint32_t* d_abort, void* stream);
 /// Holds the stream until *word (mapped host memory the host writes) equals `value`, then fences so what the host wrote
 /// before the word is visible to the work queued after it.
 void wait_word(const uint32_t* word, uint32_t value, void* stream);
+/// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
+/// outstanding at once (the split verify window keeps two).
+void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// Sets *flag = value (a mapped host flag) behind everything queued on the stream, written out to the system first: the
+/// other end of a wait_flag_ge on another device.
+void signal_flag(uint32_t* flag, uint32_t value, void* stream);
 
 /// Token graph: copy `n` floats from MAPPED pinned host memory (`src` is its device pointer) into
 /// device memory with a kernel, so the handoff stays on the compute queue (a memcpy node is a copy-engine
