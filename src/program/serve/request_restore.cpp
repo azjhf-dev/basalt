@@ -77,7 +77,9 @@ Flow Request::restore() {
     }
     resume = 0;
     from_live = false;
-    if (runtime_.o.prompt_cache > 0 && want_cvec == runtime_.cvec_cached) {
+    // A steered request (abl>0) never reuses stored state, and state a steered request left is never reused: its
+    // K/V is its ablation's.  (Steering is one bool in the cache key nowhere; both rules stand on their own.)
+    if (runtime_.o.prompt_cache > 0 && want_cvec == runtime_.cvec_cached && req_abl <= 0.0f && !runtime_.steering_cached) {
         if (runtime_.live_ok && starts_with(runtime_.live, runtime_.live_imgs)) { resume = (int64_t) runtime_.live.size(); from_live = true; }
         for (const ConvCheckpoint& c : runtime_.checks)
             if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
@@ -288,12 +290,14 @@ Flow Request::restore() {
         runtime_.report_conversations((long long) resume, restore_ms);
     }
     runtime_.ckd_finish();
-    if (want_cvec != runtime_.cvec_cached) {
+    if (want_cvec != runtime_.cvec_cached || runtime_.steering_cached || req_abl > 0.0f) {
         runtime_.live_ok = false;
         runtime_.checks.clear();
         runtime_.cvec_cached = want_cvec;
+        runtime_.steering_cached = false;   // set_steering() below re-marks it when this request steers
     }
     set_cvec();
+    if (!set_steering()) return Flow::error;   // the request's runtime directions, before its prefill
     // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
     // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
     runtime_.checks.erase(std::remove_if(runtime_.checks.begin(), runtime_.checks.end(), [&](const ConvCheckpoint& c) {

@@ -10,6 +10,7 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/log.hpp"
 #include "basalt/model/flags.hpp"
+#include "basalt/models/deepseek41/directions.hpp"
 #include "models/deepseek41/context_policy.hpp"
 #include "models/deepseek41/dspark.hpp"
 #include "models/deepseek41/meta.hpp"
@@ -44,6 +45,10 @@ public:
         if (!req.kv.empty() && !ctxp::cache_format(req.kv, fmt)) return {model::Status::Error, "deepseek41: --kv " + req.kv + ": fp8 or fp16"};
         m->set_cache_format(fmt);
         if (!m->resolve_context(req.max_context, err)) return {model::Status::Error, err};
+        if (!req.directions.empty() && !directions::open(req.directions, m->desc().n_layers, m->desc().n_embd, err))
+            return {model::Status::Error, "deepseek41: --directions: " + err};
+        if (req.abl > 0.0f && !directions::set(req.abl, ~0ULL, err))
+            return {model::Status::Error, "deepseek41: --abl: " + err};
         m->set_diag_dump(req.diag_dump);
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
         m->set_tiers(req);
@@ -91,6 +96,8 @@ public:
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
         else if (a == "--kv") o.kv = args.next("--kv");
+        else if (a == "--directions") o.directions = args.next("--directions");
+        else if (a == "--abl") o.abl = std::strtof(args.next("--abl"), nullptr);
         else if (a == "--draft-experts") o.draft_experts = std::atoi(args.next("--draft-experts"));
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;

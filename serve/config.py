@@ -401,6 +401,9 @@ def checked_sampling(req: dict) -> None:
     rd = req.get("relaxed_drafting")
     if rd is not None and rd is not False and not (_num(rd) and 0 <= rd <= 1):
         raise ValueError(f"relaxed_drafting: expected false or a number 0..1, not {rd!r}")
+    if req.get("ablation") is not None:
+        from serve.engine.ablation import checked_ablation
+        checked_ablation(req["ablation"])
 
 
 def sampling_defaults_from_config(cfg: dict) -> dict:

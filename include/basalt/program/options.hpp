@@ -48,6 +48,8 @@ struct CommonOptions {
     int peer_reserve_mib = 600;
     bool no_prompt_skip = false;  ///< --no-prompt-skip: every prompt row through every layer
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
+    std::string directions;
+    float abl = 0.0f;              // --abl: the directions' initial strength (generate's whole run; 0 = off)       ///< --directions: a runtime-directions bundle (deepseek41; empty: off)
     /// The engine's expert profile for the model (--expert-profile, else data/profiles/<key>.prof, cli::profile_key),
     /// or the --expert-profile-save file a start places from; empty means none.  A profile decides residency by routing
     /// frequency instead of by first use.

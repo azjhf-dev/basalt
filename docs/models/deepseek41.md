@@ -95,8 +95,38 @@ alone in its slot gives the same greedy tokens as with `--parallel 1` (tiers pin
 
 ## Lossy flags
 
-None. Output depends on which experts are resident, so a different RAM tier size can change the text
+None by default. Output depends on which experts are resident, so a different RAM tier size can change the text
 ([precision](../precision/deepseek41.md#experts-and-placement)).
+
+## Runtime directions (refusal-vector ablation)
+
+`--directions FILE` loads a per-layer set of unit vectors (a BSLDIR01 bundle) and, when a request asks, subtracts
+each layer's direction from its attention-output partials:
+
+    y <- y - strength * r * dot(r, y)
+
+on every token, layers 2..39 with pqhaz's vectors. This is the weight-space ablation of
+[heretic-style decensorship](https://huggingface.co/pqhaz/DeepSeek-V4.1-Flash-1017-heretic) made switchable per
+request instead of baked into the weights, after
+[anvarazizov's TensorFold recipe](https://github.com/anvarazizov/tensorfold-tp2-directions). strength 1 matches the
+heretic model's direction (its weight-space strength 2.5 lands differently; compare outputs before picking one).
+
+Build the bundle from pqhaz's `ablation_directions.pt` (no PyTorch needed, no pickle executed):
+
+    python3 tools/deepseek41_directions.py ablation_directions.pt deepseek41.directions
+
+Then `basalt serve|generate --directions deepseek41.directions ...`. Baseline output is bit-exact with the feature
+loaded but off: strength 0 skips the kernel entirely.
+
+- **serve:** a request steers with `abl=S` (strength 0..1) and `ablmask=HEX` (only those layers; absent = all the
+  bundle's) on the GEN line, or `"ablation": S` / `"ablation": {"strength": S, "layers": [2, ...]}` in the HTTP
+  API's sampling fields. A steered request never reads or leaves conversation-cache state (its K/V differs), and
+  steering refuses `--parallel` (slots share the one model state). An engine without `--directions` refuses `abl`
+  rather than answering unsteered.
+- **generate:** the whole run steers with `--abl S` (plus `--directions`).
+
+Known limits: the setting is global between requests (a steered request changes it until the next), and requests
+that steer pay a full prefill.
 
 ## Limits
 

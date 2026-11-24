@@ -8,6 +8,7 @@
 #include "basalt/platform/file.hpp"
 #include "basalt/models/deepseek41/attn.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
+#include "basalt/models/deepseek41/directions.hpp"
 #include "models/deepseek41/attn_batch.hpp"
 #include "models/deepseek41/elastic.hpp"
 #include "models/deepseek41/layer_ops.hpp"
@@ -595,6 +596,7 @@ public:
 
         AttnOutWeights ow{oa->ptr, oa->type, ob->ptr, ob->type};
         attn_out(attn_, ow, T, xq_, oa_, out, stream);
+        directions::apply(il, out, T, stream);   // exact bypass when no request steers
         return true;
     }
 

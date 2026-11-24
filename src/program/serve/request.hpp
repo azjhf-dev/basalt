@@ -33,6 +33,8 @@ protected:
     int64_t req_gprompt{};
     std::string req_grammar_text{};   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
     int req_cvec{};
+    float req_abl{};              // abl=F: the runtime directions' strength for this request (0: baseline)
+    uint64_t req_abl_mask{};    // ablmask=H: the layers to ablate (absent: every layer the bundle carries)
     float req_relax{};
     int req_ppl{};
     int req_ppl_t{};
@@ -152,6 +154,15 @@ protected:
     // ---- restoring a conversation: what it does to the model's sessions.  Per request.
     virtual bool cvec_wanted() const { return true; }
     virtual void set_cvec() {}
+    /// Applies the request's runtime directions (abl=/ablmask=) to the model, once, before its prefill.  Engines
+    /// without directions refuse a nonzero strength here, so the request fails instead of answering unsteered.
+    virtual bool set_steering() {
+        if (req_abl > 0.0f) {
+            std::printf("ERR ablation: this engine does not support runtime directions\n");
+            return false;
+        }
+        return true;
+    }
     virtual void select_view() {}
     virtual bool slot_draft_in(int) { return true; }
     virtual void drop_stale_reuse() {}

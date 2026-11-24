@@ -244,8 +244,10 @@ public:
     }
     // The outgoing conversation leaves the session for the RAM tier, or the disk tier when there is no room or the
     // session goes on holding it (`kept`) and only the disk lacks it.
+    bool steering_no_park_ = false;   // the request steered the model (abl>0): its state never enters the cache
     bool park_current(size_t held, int64_t kept) override {
         ckd_finish();   // a turn checkpoint's state may still be on its way to the host
+        if (steering_no_park_) return true;
         if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
         if (o.conversation_cache_min_tokens > 0 && (int64_t) live.size() < o.conversation_cache_min_tokens) return true;
         int64_t deepest = 0;
@@ -377,6 +379,22 @@ private:
 class SessionRequest final : public Request {
 public:
     explicit SessionRequest(SessionRuntime& runtime) : Request(runtime), rt_(runtime) {}
+
+    bool cvec_wanted() const override {
+        // Every prefix here shares the model's loaded steering.  A request's own runtime directions (abl>0) differ
+        // from that shared state, so nothing cached answers it and nothing it computes is cached (no park either).
+        return req_abl <= 0.0f;
+    }
+
+    bool set_steering() override {
+        rt_.steering_no_park_ = req_abl > 0.0f;
+        if (req_abl > 0.0f && runtime_.o.batch > 0) { std::printf("ERR ablation: not with --parallel\n"); return false; }
+        // abl=0 also resets the model after an earlier steered request.
+        const basalt::model::Result r = rt_.session().set_steering(req_abl, req_abl_mask);
+        if (!r.ok()) { std::printf("ERR %s\n", r.message.c_str()); return false; }
+        if (req_abl > 0.0f) runtime_.steering_cached = true;   // what this request leaves behind is steered
+        return true;
+    }
 
     static constexpr bool kSpeculates = true;
     /// No adaptive step: the model's tiers move by themselves.

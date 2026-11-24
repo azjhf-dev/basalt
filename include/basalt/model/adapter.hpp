@@ -96,6 +96,10 @@ struct LoadRequest {
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
+    /// --directions: a runtime-directions bundle (deepseek41: tools/deepseek41_directions.py writes one; empty: off)
+    std::string directions;
+    /// --abl: the directions' initial strength (0: off until a request's abl= key)
+    float abl = 0.0f;
 };
 
 struct DecodeRequest {
@@ -153,6 +157,14 @@ public:
     virtual void end_prompt() {}
     /// A logit bias (device copy, n_vocab floats) for the next draws; null clears it.
     virtual Result set_logit_bias(const float* bias) { (void) bias; return {Status::NotImplemented, "this model takes no logit bias"}; }
+
+    /// The runtime directions (activation steering) the next prompts and windows run with: a strength in [0,1] and
+    /// the layers to ablate; strength 0 is the exact baseline.  The state stays until the next call.
+    virtual Result set_steering(float strength, uint64_t mask) {
+        (void) strength;
+        (void) mask;
+        return {Status::NotImplemented, "this model has no runtime directions"};
+    }
     /// Draws the token of row `row` of the last decoded window again under `bias` (n_vocab floats): the grammar's mask.
     virtual Result resample_row(int row, const float* bias, int32_t& token) { (void) row; (void) bias; (void) token; return {Status::NotImplemented, "this model cannot draw again"}; }
     /// The rows a decode window may hold; 1 when the session drafts nothing.

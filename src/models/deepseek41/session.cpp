@@ -11,6 +11,7 @@
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
+#include "basalt/models/deepseek41/directions.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
 #include "models/deepseek41/attn_batch.hpp"
 #include "models/deepseek41/dspark.hpp"
@@ -373,7 +374,15 @@ public:
         std::string e;
         ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         const std::string kv = m_.cache_format() == CacheFormat::Fp8 ? "kv=fp8+fp4" : "kv=fp16";
-        return t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill());
+        const std::string dir = directions::loaded() ? " directions=" + directions::summary() : "";
+        return (t == nullptr ? kv : "expert_slots=" + std::to_string(t->slots()) + " " + kv + " " + program::spill_words(t->spill())) + dir;
+    }
+
+    /// The ablation a request asks for (the GEN line's abl=/ablmask= keys), kept until the next request's.
+    model::Result set_steering(float strength, uint64_t mask) override {
+        std::string err;
+        if (!directions::set(strength, mask, err)) return {model::Status::Error, "ablation: " + err};
+        return {};
     }
 
     size_t cells_bytes(int64_t positions) const override { return ops_ ? ops_->cache_bytes(positions) : 0; }

@@ -3,6 +3,8 @@
 #include "../cli/tokens.hpp"
 #include "logprobs.hpp"
 
+#include <cmath>
+
 namespace basalt::program::serve {
 
 Flow Request::parse() {
@@ -33,6 +35,8 @@ Flow Request::parse() {
     req_bias_present = false;
     req_gprompt = -1;       // gprompt=N: the first N ids are the prompt, the rest tokens the request has already generated
     req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+    req_abl = 0.0f;   // abl=F: runtime directions (a directions bundle) at this strength (0: off)
+    req_abl_mask = ~0ULL;   // ablmask=H: only these layers (absent: all the bundle's)
     req_relax = default_relax();   // relax=P: this request's --relaxed-drafting (0 = exact)
     // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
     // the chunk teacher-forced through verify windows of T tokens, every token committed
@@ -56,6 +60,8 @@ Flow Request::parse() {
             else if (key == "grammar") req_grammar_text = tok.substr(eq + 1);
             else if (key == "gprompt") req_gprompt = std::atoll(tok.c_str() + eq + 1);
             else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+            else if (key == "abl") req_abl = fv;
+            else if (key == "ablmask") req_abl_mask = std::strtoull(tok.c_str() + eq + 1, nullptr, 16);
             else if (key == "temperature") req_temperature = fv;
             else if (key == "top_p") req_top_p = fv;
             else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -88,6 +94,8 @@ Flow Request::parse() {
     else if (!(req_relax >= 0.0f && req_relax <= 1.0f)) bad = "relax: 0..1";
     else if (req_logprobs < -1 || req_logprobs > kMaxTopLogprobs) bad = "logprobs: 0 to 20 alternatives";
     else if (req_logprobs >= 0 && runtime_.o.batch > 0 && runtime_.pipelined()) bad = "logprobs: pipelined batch groups are not supported";
+    if (bad == nullptr && (!std::isfinite(req_abl) || req_abl < 0.0f || req_abl > 1.0f)) bad = "abl: 0..1";
+    if (bad == nullptr && runtime_.o.batch > 0 && req_abl > 0.0f) bad = "abl: not with --parallel";
     if (bad == nullptr && runtime_.o.batch > 0 && runtime_.pipelined() && req_penalty_last_n > 0 &&
         (req_penalty_repeat != 1.0f || req_penalty_freq != 0.0f || req_penalty_present != 0.0f))
         bad = "penalties: pipelined batch groups are not supported";

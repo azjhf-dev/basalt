@@ -193,7 +193,8 @@ add_library(model_deepseek41 STATIC src/models/deepseek41/adapter.cpp src/models
   src/models/deepseek41/model.cpp src/models/deepseek41/session.cpp src/models/deepseek41/layer_ops.cpp
   src/models/deepseek41/elastic.cpp src/models/deepseek41/ops_kernels.cpp src/models/deepseek41/tier.cpp src/models/deepseek41/file_reads.cpp src/models/deepseek41/prompt_host.cpp src/models/deepseek41/ops.cu
   src/models/deepseek41/prefill.cpp src/models/deepseek41/prefill_ffn.cpp src/models/deepseek41/prefill_ffn.cu src/models/deepseek41/attn_batch.cpp src/models/deepseek41/attn_dense.cu
-  src/models/deepseek41/dspark.cpp src/models/deepseek41/dspark_kernels.cu)
+  src/models/deepseek41/dspark.cpp src/models/deepseek41/dspark_kernels.cu
+  src/models/deepseek41/directions.cpp src/models/deepseek41/kernels/directions.cu)
 target_include_directories(model_deepseek41 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/src/program/tokenizer)
 target_link_libraries(model_deepseek41 PUBLIC model tokenizer serve_shared deepseek41_kernels deepseek41_attn deepseek41_vision tiers mmq peer_share kernels core ${_gpu_runtime_target})
 endif()
@@ -293,6 +294,11 @@ if(BUILD_TESTING)
   target_include_directories(tier_policy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   basalt_embed_manifest(tier_policy_test)
   basalt_cpu_test(NAME tier_policy_test COMMAND tier_policy_test)
+  # the runtime-directions bundle parser: geometry, unit norms and mask checks on synthetic bundles (no GPU)
+  add_executable(directions_test src/models/deepseek41/directions_test.cpp src/models/deepseek41/directions.cpp)
+  target_include_directories(directions_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  basalt_embed_manifest(directions_test)
+  basalt_cpu_test(NAME directions_test COMMAND directions_test)
   # the RAM tier's file reads land every blob byte for byte (no GPU)
   add_executable(file_reads_test src/models/deepseek41/file_reads_test.cpp src/models/deepseek41/file_reads.cpp)
   target_include_directories(file_reads_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)

@@ -8,6 +8,7 @@
 
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
+#include "basalt/models/deepseek41/directions.hpp"
 #include "basalt/models/deepseek41/prefill_attn.hpp"
 #include "basalt/models/deepseek41/prefill_index.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -240,6 +241,7 @@ private:
         ctx_.run(p, stream);
         mmq::quantize(oa_, nullptr, xq_, ob->type, kAttnGroups * kAttnOutRank, kAttnGroups * kAttnOutRank, S, stream);
         gemm(ob, kAttnEmbd, kAttnGroups * kAttnOutRank, xq_, S, out, stream);
+        directions::apply(il, out, S, stream);   // exact bypass when no request steers
         return true;
     }
 

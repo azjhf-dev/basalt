@@ -42,6 +42,7 @@ from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, engine_key as logprobs_key, parse_line as logprob_line, \
     token as logprob_token
 from serve.engine import lifeline, suspend
+from serve.engine.ablation import ablation_key
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, split_err
 from serve.engine.slots import AdmissionQueue
@@ -714,8 +715,9 @@ class ProcessEngine:
             keys += " relax=0"
         elif _number(rd):
             keys += f" relax={float(rd)!r}"
-        return keys + ProcessEngine.projection_key(sampling) + bias_key(sampling.get(BIAS_KEY)) \
-            + grammar_key(sampling.get(GRAMMAR_KEY)) + logprobs_key(sampling.get(LOGPROBS_KEY))
+        return keys + ProcessEngine.projection_key(sampling) + ablation_key(sampling) \
+            + bias_key(sampling.get(BIAS_KEY)) + grammar_key(sampling.get(GRAMMAR_KEY)) \
+            + logprobs_key(sampling.get(LOGPROBS_KEY))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:

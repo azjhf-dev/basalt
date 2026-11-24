@@ -162,6 +162,9 @@ public:
     void keep_check(ConvCheckpoint&& c);
     uint64_t check_clock{};
     bool cvec_cached{};
+    /// The live state was computed under a request's runtime directions (abl>0): nothing reuses it, and the next
+    /// request drops it.  Cleared when that state is dropped.
+    bool steering_cached{};
     std::optional<basalt::core::ConversationCache> conversations;
     // the disk tier under it (--conversation-cache-dir): what leaves the session or the RAM cache is written there,
     // and a prompt that starts with a stored conversation reads it back, after a restart too
