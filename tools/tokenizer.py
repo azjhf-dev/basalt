@@ -51,7 +51,20 @@ JOYAI_PATTERNS = [
     r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 ]
-PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS}
+# The `ernie5` pre-tokenizer, transcribed from baidu/ERNIE-5.5-Flash-Preview's tokenizer.json (a Sequence of
+# Digits + five Splits; the digit Splits capture the runs Digits would group, and ByteLevel is the byte step the
+# gpt2 BPE model already implies). The regexes apply in turn, as `joyai-llm`'s do. `\A`, `\G` and the atomic
+# group are the checkpoint's own anchors.
+ERNIE5_PATTERNS = [
+    r"\p{Nd}{1,510}(?=(?>\p{Nd}{510})*(?:\P{Nd}|$))|\G\p{Nd}{510}",
+    # Oniguruma reads `{3}+` as repeated groups of three; Python regex reads it as a possessive {3}.
+    r"\A\p{Nd}{1,2}(?=(?:\p{Nd}{3})+\z)",
+    r"\A\p{Nd}{3}|\G\p{Nd}{3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+]
+PRE_PATTERNS = {"joyai-llm": JOYAI_PATTERNS, "ernie5": ERNIE5_PATTERNS}
 
 
 class Tokenizer:

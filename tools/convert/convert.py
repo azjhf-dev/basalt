@@ -540,6 +540,13 @@ def from_checkpoint(a) -> None:
     checkpoint's files); drafter and vision are copied from BASE byte for byte."""
     import multiprocessing
     import checkpoint as C
+    cfg = Path(a.checkpoint) / "config.json"
+    if cfg.is_file() and json.loads(cfg.read_text(encoding="utf-8")).get("model_type") == "ernie5_5_moe":
+        if a.sections_from:
+            die("an ERNIE 5.5 checkpoint converts whole; drop --sections-from")
+        import checkpoint_ernie55 as E
+        E.build(a, Job, fingerprint, die)
+        return
     out, src = Path(a.out), Path(a.sections_from)
     if src.is_file() and json.loads(ModelFile(str(src)).read("meta")).get("arch") == "deepseek41":
         if a.dense_q8_0 or a.mtp_dense:
@@ -821,6 +828,12 @@ def main():
             ap.error(f"missing input: {a.drafter}")
         if not Path(a.checkpoint).is_dir():
             ap.error(f"missing input: {a.checkpoint}")
+        cfg = Path(a.checkpoint) / "config.json"
+        if cfg.is_file() and json.loads(cfg.read_text(encoding="utf-8")).get("model_type") == "ernie5_5_moe":
+            if a.drafter:
+                ap.error("ERNIE 5.5 already includes its drafter; drop --drafter")
+            from_checkpoint(a)
+            return
         import checkpoint_qwen35 as Q
         Q.build(a, Job, fingerprint, die)
         return
