@@ -100,12 +100,14 @@ Documented pack SHA-256:
 If your existing pack differs, record its exact hash and name. Do not compare
 results from different pack formats as if they were engine-only changes.
 
-Primary comparison: `--gpu 0 --max-context 262144 --kv fp8 --spec 8`, single session,
-no images. Start at 32K prompt depth before 131K. FP8 is supported by both builds;
-v0.5.7 does not have this branch's INT8-KV addition. Test INT8 against the bundle's
-FP8 separately, with fresh runs and a quality gate. It is not a like-for-like
-v0.5.7 INT8 comparison. Keep the auto-selected pool-worker count the same, or pin
-`--pool-workers N` identically after inspecting the startup logs.
+Primary comparison: `--gpu 0 --max-context 262144 --kv int8 --spec 8`, single session,
+no images. Start at 32K prompt depth before 131K. INT8 KV is supported by both
+builds (v0.5.7 already includes #552); #606 changes its attention reader, rather
+than introducing the cache format. This matched INT8 comparison exercises #606.
+The commands below use INT8. Repeat the same full ABBA sequence
+with `--kv fp8` on both A and B as a control, saving to separate output directories.
+Compare each cache format separately. Keep the auto-selected pool-worker count the
+same, or pin `--pool-workers N` identically after inspecting startup logs.
 
 Optional HTTP configs are in `experiments/inkling2-5060ti/config-*.json`. Replace
 `REPLACE_WITH_ABSOLUTE_MODEL_PATH`, keep logical GPU 0 and bind to loopback port
@@ -125,7 +127,7 @@ cd "$B"
 for label in A B; do
   tree=$A; [ "$label" = B ] && tree=$B
   "$tree/bin/basalt-bench" --engine "$tree/bin/basalt" --model "$MODEL" \
-    --fixtures "$B/data/bench/inkling2" --gpu 0 --max-context 262144 --kv fp8 --spec 8 \
+    --fixtures "$B/data/bench/inkling2" --gpu 0 --max-context 262144 --kv int8 --spec 8 \
     -t conv,struct,prose -p 16384 --seed 42 -r 1 -o json \
     --logs "$RESULTS/warmup-$label" > "$RESULTS/warmup-$label.json"
 done
@@ -133,7 +135,7 @@ n=0
 for label in A B B A; do
   n=$((n+1)); tree=$A; [ "$label" = B ] && tree=$B
   "$tree/bin/basalt-bench" --engine "$tree/bin/basalt" --model "$MODEL" \
-    --fixtures "$B/data/bench/inkling2" --gpu 0 --max-context 262144 --kv fp8 --spec 8 \
+    --fixtures "$B/data/bench/inkling2" --gpu 0 --max-context 262144 --kv int8 --spec 8 \
     -t conv,struct,prose -p 16384,32768,131072 --seed 42 -r 1 -o json \
     --logs "$RESULTS/$n-$label" > "$RESULTS/$n-$label.json" || break
 done
@@ -149,7 +151,7 @@ for label in A B B A; do
   for depth in 32768 131072; do
     python3 tools/inkling2_deep_ab.py --engine "$tree/bin/basalt" --model "$MODEL" \
       --fixtures "$B/data/bench/inkling2" --depth "$depth" --max-context 262144 \
-      --kv fp8 --spec 8 --tokens 512 \
+      --kv int8 --spec 8 --tokens 512 \
       --out "$RESULTS/deep-$n-$label-$depth.json" || exit 1
   done
 done
@@ -170,9 +172,11 @@ both with fixed requests and check truncation, malformed tool calls and regressi
 If you have a validated KLD reference for this same pack, also run the documented
 `basalt-bench --quality --kld-base FILE` gate; do not invent a reference or threshold.
 
-After the FP8 comparison, repeat bundle-only commands with `--kv int8`. Save to
-new filenames. This measures the INT8 memory/performance tradeoff separately.
-Start with 32K; only go to 131K after parity and quality checks pass. A 239K prompt
+After the INT8 comparison, repeat the full A/B commands with `--kv fp8` for both
+builds and a new RESULTS directory. The matched INT8 A/B is the main test of #606's
+reader together with the other bundle optimizations. Compare INT8 against FP8 within
+each build for its memory/performance tradeoff. Start with 32K; only go to 131K
+after parity and quality checks pass. A 239K prompt
 is optional after the smaller tests fit. Do not assume a 5080's 451 structured
 tok/s is sustained chat speed or a target for this 5060 Ti.
 
@@ -186,7 +190,7 @@ tok/s is sustained chat speed or a target for this 5060 Ti.
   32K/131K decode. Percent gain is `(B/A - 1) * 100` using matched metrics.
 - TTFT, generated lengths, draft acceptance, GPU expert hit rate, CPU expert share,
   placement/copy-set messages, OOM/CUDA errors, and real eval pass counts.
-- Identify FP8 bundle-v-release separately from INT8-v-FP8 on the bundle.
+- Identify matched INT8 A/B separately from FP8 A/B, and cache-format tradeoffs.
 
 ## v0.5.7 config break and rollback
 
