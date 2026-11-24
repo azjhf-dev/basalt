@@ -359,9 +359,10 @@ class Plan:
             if sc not in self.ck.t:
                 raise S.ConvertError(f"the checkpoint has no scale tensor for {src}")
             _, _, sdt, sshape, _ = self.ck.t[sc]
-            if sdt != "F32" or len(sshape) != 2 or [s * 128 for s in sshape] != list(shape):
+            expected_scales = [(s + 127) // 128 for s in shape]
+            if sdt != "F32" or list(sshape) != expected_scales:
                 raise S.ConvertError(f"{sc} is {sdt} {sshape}; expected F32 "
-                                     f"{[s // 128 for s in shape]} blocks of 128 x 128")
+                                     f"{expected_scales} blocks of 128 x 128")
         elif dt != "BF16":
             raise S.ConvertError(f"{src} is {dt}; expected BF16")
         self._add(name, "Q8_0", src, how, [shape[1], shape[0]])
@@ -455,7 +456,7 @@ def _quant_job(args):
     else:
         codes = np.memmap(path, dtype=np.uint8, mode="r", offset=off + row0 * ne0, shape=(rows, ne0))
         sp, soff, _, _, _ = scale
-        nb0 = ne0 // 128
+        nb0 = (ne0 + 127) // 128
         br0, br1 = row0 // 128, (row0 + rows + 127) // 128
         sc = np.memmap(sp, dtype="<f4", mode="r", offset=soff + 4 * (br0 * nb0), shape=(br1 - br0, nb0))
         if np.isnan(sc).any():
@@ -465,7 +466,7 @@ def _quant_job(args):
             return "a NaN E4M3 weight"
         s = np.repeat(np.repeat(sc, 128, 0), 128, 1)
         skip = row0 - br0 * 128
-        x = (v * s[skip:skip + rows]).astype(np.float32).reshape(-1)
+        x = (v * s[skip:skip + rows, :ne0]).astype(np.float32).reshape(-1)
     if not np.isfinite(x).all():
         return "a non-finite value"
     return S.q8_0(x)

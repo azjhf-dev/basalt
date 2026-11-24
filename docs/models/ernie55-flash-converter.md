@@ -27,9 +27,9 @@ No streaming download/deletion mode is implemented. Budget disk for both the che
 
 ## Verification
 
-- 9 new tests: synthetic three-layer checkpoint, actual CLI conversion and pack readback, MXFP4 byte layout,
-  expert tail, FP8/Q8_0 values, metadata, coverage, VHA/router transforms, orphan-scale rejection and digit grouping.
-- Full converter suite: **119 tests passed**.
+- 10 new tests: synthetic three-layer checkpoint, actual CLI conversion and pack readback, MXFP4 byte layout,
+  expert tail, FP8/Q8_0 values, metadata, coverage, VHA/router transforms, orphan-scale rejection, digit grouping and partial FP8 blocks.
+- Full converter suite: **120 tests passed**.
 - Existing tokenizer suite: **6 tests run, 1 skipped** because no real tokenizer directory was supplied.
 - Source pre-tokenizer versus Python implementation: **2,106 cases passed**, including long digit runs,
   Unicode digits, mixed scripts, whitespace and seeded random text. Oracle used the original pre-tokenizer
@@ -52,6 +52,9 @@ The model adapter and CUDA kernels do not exist yet. Existing Basalt builds shou
 - The original KV estimate was a rough placeholder, not an allocation model. HCA has a fixed window plus
   compressed history, rather than one full HCA row per historical token. Runtime cache sizing is still open.
 - Converter code lives in `tools/convert/checkpoint_ernie55.py`, not the originally proposed `arch/` path.
+
+Post-check fix: sampled MLA `kv_a` has 576 rows and five scale rows, so FP8 scale grids use ceil division
+by 128 and slice the final partial block. A regression test covers a partial block.
 
 ## Next gate
 

@@ -34,7 +34,7 @@ def fp8_tensor(rng, rows, cols):
     codes = np.zeros((rows, cols), np.uint8)
     for v, c in E4M3_CODES.items():
         codes[vals == v] = c
-    scales = np.ones((rows // 128, cols // 128), np.float32)
+    scales = np.ones(((rows + 127) // 128, (cols + 127) // 128), np.float32)
     return codes.tobytes(), scales.tobytes(), vals
 
 
@@ -60,7 +60,7 @@ class TinyCheckpoint:
             codes, scales, vals = fp8_tensor(rng, rows, cols)
             add(name, codes, "F8_E4M3", [rows, cols])
             base = name[:-len(".weight")] + ".weight_scale_inv" if name.endswith(".weight") else name + "_scale_inv"
-            add(base, scales, "F32", [rows // 128, cols // 128])
+            add(base, scales, "F32", [(rows + 127) // 128, (cols + 127) // 128])
             self.expect_q8[name] = vals
 
         def add_bf16(name, shape):
@@ -102,7 +102,7 @@ class TinyCheckpoint:
             else:                  # MLA (DSA)
                 add_fp8(pre + "self_attn.q_a_proj.weight", 128, H)
                 add_fp8(pre + "self_attn.q_b_proj.weight", 256, 128)
-                add_fp8(pre + "self_attn.kv_a_proj_with_mqa.weight", 128, H)
+                add_fp8(pre + "self_attn.kv_a_proj_with_mqa.weight", 160, H)
                 add_fp8(pre + "self_attn.kv_b_proj.weight", 256, 128)
                 add_fp8(pre + "self_attn.o_proj.weight", H, 256)
                 add_bf16(pre + "self_attn.q_a_layernorm.weight", (128,))
@@ -289,6 +289,15 @@ class Ernie55Test(unittest.TestCase):
         # Q8_0 of exact E4M3 values times unit scales is near-exact
         np.testing.assert_allclose(got, self._fp8_want("model.layers.0.mlp.gate_proj.weight", (128, H)),
                                    atol=2.0 / 256, rtol=0.02)
+
+    def test_partial_fp8_scale_block(self):
+        import multiprocessing
+        plan = E.Plan(self.ck)
+        with multiprocessing.Pool(2) as pool:
+            raw = b"".join(plan.chunks("blk.2.attn_kv_a_mqa.weight", pool))
+        got = q8_0_values(raw).reshape(160, H)
+        np.testing.assert_allclose(got, self._fp8_want("model.layers.2.self_attn.kv_a_proj_with_mqa.weight",
+                                                     (160, H)), atol=2.0 / 256, rtol=0.02)
 
     def _fp8_want(self, name, shape):
         wp, wo, _, _, _ = self.ck.t[name]
