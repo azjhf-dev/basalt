@@ -315,6 +315,41 @@ class Ernie55Test(unittest.TestCase):
             self.assertEqual("".join(pieces), "1" * n)
             self.assertLessEqual(max(map(len, pieces)), 3)
 
+    def test_contract_matches_cpp_pack_hpp(self):
+        """The C++ runtime contract (src/models/ernie55/pack.hpp's expected_tensors) derived by the same
+        layer-class rules equals this converter's tensor table for the tiny checkpoint. Keeps the two
+        languages' name tables from drifting."""
+        def cls(l):
+            attn = "hca" if l != 2 else "mla"      # tiny checkpoint: layers 0, 1 HCA, layer 2 MLA
+            ffn = "dense" if l == 0 else "moe"
+            return attn, ffn
+        common = (["attn_gate.weight"],
+                  ["attn_norm.weight", "ffn_norm.weight", "attn_vha.weight",
+                   "hc_attn_fn.weight", "hc_attn_base.weight", "hc_attn_scale.weight",
+                   "hc_ffn_fn.weight", "hc_ffn_base.weight", "hc_ffn_scale.weight"], [])
+        hca = (["attn_q_a.weight", "attn_q_b.weight", "attn_kv.weight",
+                "attn_output_a.weight", "attn_output_b.weight"],
+               ["attn_sinks.weight", "attn_q_a_norm.weight", "attn_kv_a_norm.weight",
+                "attn_compressor_ape.weight", "attn_compressor_norm.weight"],
+               ["attn_compressor_kv.weight", "attn_compressor_gate.weight"])
+        mla = (["attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "attn_kv_b.weight",
+                "attn_output.weight", "indexer.attn_q_b.weight"],
+               ["attn_sinks.weight", "attn_q_a_norm.weight", "attn_kv_a_norm.weight",
+                "indexer.k_norm.weight", "indexer.k_norm.bias"],
+               ["indexer.attn_k.weight", "indexer.proj.weight"])
+        dense = (["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"], [], [])
+        moe = (["ffn_latent_down.weight", "ffn_latent_up.weight",
+                "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"],
+               ["ffn_gate_inp.weight", "exp_probs_b.bias", "exp_scale.weight", "ffn_latent_norm.weight"], [])
+        tables = {"hca": hca, "mla": mla, "dense": dense, "moe": moe}
+        want = {"token_embd.weight", "output.weight", "output_norm.weight",
+                "output_hc_base.weight", "output_hc_scale.weight", "output_hc_fn.weight"}
+        for l in range(3):
+            for tab in (common, tables[cls(l)[0]], tables[cls(l)[1]]):
+                want.update(f"blk.{l}.{n}" for group in tab for n in group)
+        plan = E.Plan(self.ck)
+        self.assertEqual(set(plan.tensors), want)
+
     def test_metadata(self):
         kv = E.model_kv(self.ck, "Tiny-ERNIE")
         A = "ernie55."

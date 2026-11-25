@@ -222,6 +222,22 @@ if(BUILD_TESTING)
 endif()
 endif()
 
+if(BASALT_MODEL_ERNIE55)
+# ERNIE 5.5 Flash Preview: adapter plus the hparams and tensor contract. The compute path (HCA / MLA-DSA
+# attention, latent MoE, mHC, MultiMax, DSpark) does not exist yet, so the adapter fails closed at load.
+# No CUDA sources.
+add_library(model_ernie55 STATIC src/models/ernie55/adapter.cpp)
+target_include_directories(model_ernie55 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
+target_link_libraries(model_ernie55 PUBLIC model core ${_gpu_runtime_target})
+if(BUILD_TESTING)
+  # the hparams/tensor contract against the Preview's real metadata (host only, no CUDA)
+  add_executable(ernie55_contract_test src/models/ernie55/contract_test.cpp)
+  target_include_directories(ernie55_contract_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(ernie55_contract_test PRIVATE warnings)
+  basalt_cpu_test(NAME ernie55_contract_test COMMAND ernie55_contract_test)
+endif()
+endif()
+
 # The composition root links the built models and sees their ids (BASALT_MODEL_<ARCH>) and the registration list.
 add_library(models STATIC src/models/builtin.cpp)
 target_include_directories(models PRIVATE ${CMAKE_BINARY_DIR}/generated)
