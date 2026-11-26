@@ -169,7 +169,9 @@ class TinyCheckpoint:
             "n_routed_experts": NE, "num_experts_per_tok": 2, "n_shared_experts": 1,
             "moe_intermediate_size": FF, "moe_latent_size": LAT, "norm_topk_prob": True,
             "routed_scaling_factor": 3.0, "activation_situ_beta": 4.0, "activation_situ_linear_beta": 25.0,
-            "dspark_block_size": 7, "dspark_markov_rank": 256, "dspark_target_layer_ids": [40, 41, 42],
+            "dspark_block_size": 7, "dspark_markov_rank": 256, "dspark_target_layer_ids": [0, 1, 2],
+            # the real model's stages are layers 40-42; the tiny checkpoint keeps them in range so the
+            # runtime contract (targets < block_count) accepts the synthetic pack too
             "dspark_noise_token_id": 1024, "bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0,
         }), encoding="utf-8")
         (d / "tokenizer.json").write_text(json.dumps({

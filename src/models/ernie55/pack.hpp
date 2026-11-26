@@ -6,6 +6,11 @@
 
 #include "models/ernie55/meta.hpp"
 
+#include "basalt/core/model_file.hpp"
+
+#include <cstdint>
+#include <cstdio>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -131,5 +136,101 @@ inline std::string check_geometry(const Geometry& g) {
     if (g.latent != g.n_ff_exp) return "latent MoE expects moe_latent_size == moe_intermediate_size";
     return {};
 }
+
+// ---------------------------------------------------------------- the loader's view (pack.cpp)
+// Below the contract: what open_pack fills from a converted pack. The pure helpers are here so the pack test
+// exercises them without CUDA.
+
+/// Bytes of one ggml MXFP4 row of `n` values (17 per 32), as the converter's experts section stores them.
+inline uint64_t mxfp4_row_bytes(uint64_t n) { return n / 32 * 17; }
+
+/// Bytes of one routed expert's blob: gate | up | down MXFP4 rows plus the FP32 tail {1, 1, 1, 0}.
+inline uint64_t expert_blob_bytes(const Geometry& g) {
+    return 2 * (uint64_t) g.n_ff_exp * mxfp4_row_bytes((uint64_t) g.latent) +
+           (uint64_t) g.latent * mxfp4_row_bytes((uint64_t) g.n_ff_exp) + 16;
+}
+
+/// Expected bytes of a contract tensor of `type` holding `values` values.
+inline uint64_t tensor_bytes(int type, uint64_t values) {
+    switch (type) {
+    case kTypeF32: return 4 * values;
+    case kTypeBF16: return 2 * values;
+    case kTypeQ8_0: return values / 32 * 34;
+    default: return 0;
+    }
+}
+
+struct ExpertRow {
+    int layer = -1;
+    int gu_type = 0, d_type = 0;
+    uint64_t offset = 0, blob_bytes = 0;   ///< offset inside the experts section
+};
+
+struct TensorRef {
+    std::string name;
+    int type = 0;
+    std::vector<uint64_t> shape;   ///< pack order (innermost first, as the converter writes it)
+    uint64_t offset = 0;           ///< absolute file offset
+    uint64_t bytes = 0;
+};
+
+/// Parses the experts.layout v6 text ("layer gu_type d_type offset blob_bytes" per MoE layer). `rows` comes out
+/// one per MoE layer, offsets ascending in the packed order. Pure: the pack test feeds it strings.
+inline std::string parse_experts_layout(const std::string& text, const Geometry& g, std::vector<ExpertRow>& rows) {
+    rows.clear();
+    uint64_t expect_off = 0;
+    const uint64_t blob = expert_blob_bytes(g);
+    const int n_moe = g.n_layers - g.first_dense;
+    for (size_t pos = 0; pos < text.size();) {
+        const size_t nl = text.find('\n', pos);
+        const std::string line = text.substr(pos, (nl == std::string::npos ? text.size() : nl) - pos);
+        pos = nl == std::string::npos ? text.size() : nl + 1;
+        if (line.empty() || line[0] == '#') continue;
+        ExpertRow r;
+        unsigned long long gu, d, off, by;
+        if (std::sscanf(line.c_str(), "%d %llu %llu %llu %llu", &r.layer, &gu, &d, &off, &by) != 5)
+            return "experts.layout: bad line '" + line + "'";
+        r.gu_type = (int) gu;
+        r.d_type = (int) d;
+        r.offset = off;
+        r.blob_bytes = by;
+        if (r.layer < g.first_dense || r.layer >= g.n_layers)
+            return "experts.layout: layer " + std::to_string(r.layer) + " is not a MoE layer";
+        if (r.gu_type != kTypeMXFP4 || r.d_type != kTypeMXFP4)
+            return "experts.layout: layer " + std::to_string(r.layer) + " is not MXFP4";
+        if (r.blob_bytes != blob)
+            return "experts.layout: layer " + std::to_string(r.layer) + " blob " + std::to_string(r.blob_bytes) +
+                   " != " + std::to_string(blob);
+        if (r.offset != expect_off)
+            return "experts.layout: layer " + std::to_string(r.layer) + " offset " + std::to_string(r.offset) +
+                   " breaks the packed order (expected " + std::to_string(expect_off) + ")";
+        expect_off += r.blob_bytes * (uint64_t) g.n_expert;
+        rows.push_back(r);
+    }
+    if ((int) rows.size() != n_moe)
+        return "experts.layout lists " + std::to_string(rows.size()) + " MoE layers, the model has " +
+               std::to_string(n_moe);
+    return {};
+}
+
+struct Pack {
+    core::ModelFile file;
+    Geometry geo;
+    std::map<std::string, TensorRef> tensors;
+    std::vector<ExpertRow> experts;      ///< one per MoE layer, packed order
+    core::FileRange experts_range;
+    core::FileRange dspark_raw;          ///< the raw drafter bytes (folded by the drafter's own stage)
+    core::Json dspark_manifest;          ///< name -> dtype, shape, offset, bytes
+
+    const TensorRef* find(const std::string& n) const {
+        auto it = tensors.find(n);
+        return it == tensors.end() ? nullptr : &it->second;
+    }
+};
+
+/// Opens a converted ERNIE 5.5 pack and enforces the whole contract: metadata geometry, exact tensor table,
+/// sections, experts layout, drafter manifest. False with `err` on the first violation. No device work: this is
+/// the structural loader the compute path builds on, and it refuses anything that is not the contract.
+bool open_pack(const std::string& path, Pack& p, std::string& err);
 
 }  // namespace basalt::models::ernie55

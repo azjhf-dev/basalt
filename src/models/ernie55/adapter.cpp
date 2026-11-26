@@ -28,12 +28,14 @@ Kv kv_of(const GgufFile& g) {
         return true;
     };
     kv.u_arr = [&](const std::string& k, std::vector<uint64_t>& out) {
+        out.clear();
         const MetaValue* v = g.get(k);
         if (!v) return false;
         for (const MetaValue& it : v->items) out.push_back(it.u);
         return true;
     };
     kv.f_arr = [&](const std::string& k, std::vector<double>& out) {
+        out.clear();
         const MetaValue* v = g.get(k);
         if (!v) return false;
         for (const MetaValue& it : v->items) out.push_back(it.num());
@@ -75,12 +77,18 @@ public:
     }
 
     model::Result load(const model::LoadRequest& req, std::unique_ptr<model::LoadedModel>& out) const override {
-        (void) req;
         (void) out;
-        // Fail closed: a converted pack is a real artifact, but there is no compute path for it yet. Loading
-        // it into a session would produce plausible-looking garbage, which is worse than a clear refusal.
+        if (req.paths.empty()) return {model::Status::Error, "ernie55: no model path"};
+        // The structural loader enforces the whole contract (geometry, exact tensor table, sections, experts
+        // layout, drafter manifest); a malformed pack is an error, not a partially loaded model.
+        Pack pack;
+        std::string err;
+        if (!open_pack(req.paths.front(), pack, err)) return {model::Status::Error, "ernie55: " + err};
+        // Then fail closed: the pack is structurally valid, but HCA / MLA-DSA attention, latent MoE, mHC,
+        // MultiMax and DSpark compute do not exist yet. Loading it into a session would produce
+        // plausible-looking garbage, which is worse than a clear refusal.
         return {model::Status::NotImplemented,
-                "ernie55: the pack converts, but the runtime (HCA / MLA-DSA attention, latent MoE, mHC, "
+                "ernie55: the pack is valid, but the runtime (HCA / MLA-DSA attention, latent MoE, mHC, "
                 "MultiMax, DSpark) is not implemented yet. Track docs/models/ernie55-flash-converter.md "
                 "and docs/models/ernie55-runtime-contract.md."};
     }
