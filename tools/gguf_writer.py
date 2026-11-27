@@ -20,7 +20,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from gguf_reader import GGUF_MAGIC, GGUFFile  # noqa: E402
 
 # writable ggml_type ids, matching GGML_TYPES in gguf_reader.py
-TYPE_IDS = {"F32": 0, "F16": 1, "Q5_K": 13, "Q6_K": 14, "Q8_0": 8, "Q2_0": 42, "IQ2_XXS": 16, "IQ1_S": 19, "IQ4_NL": 20, "BF16": 30}
+TYPE_IDS = {"F32": 0, "F16": 1, "Q5_K": 13, "Q6_K": 14, "Q8_0": 8, "Q2_0": 42, "IQ2_XXS": 16, "IQ1_S": 19, "IQ4_NL": 20,
+            "MXFP4": 39, "BF16": 30, "Q4_K": 12, "F8_E4M3_RAW": 43}
 DEFAULT_ALIGNMENT = 32
 
 _META_IDS = {"u8": 0, "i8": 1, "u16": 2, "i16": 3, "u32": 4, "i32": 5, "f32": 6,
@@ -117,7 +118,8 @@ class GGUFWriter:
     # ---- serialisation
     def _kv_bytes(self, key: str, type_name: str, value) -> bytes:
         out = bytearray()
-        out += struct.pack("<Q", len(key)) + key.encode("utf-8")
+        kb = key.encode("utf-8")
+        out += struct.pack("<Q", len(kb)) + kb
         if type_name.startswith("array:"):
             elem = type_name.split(":", 1)[1]
             out += struct.pack("<I", _META_IDS["array"])
@@ -153,7 +155,8 @@ class GGUFWriter:
         offset = 0
         infos = bytearray()
         for t in self.tensors:
-            infos += struct.pack("<Q", len(t.name)) + t.name.encode("utf-8")
+            nb = t.name.encode("utf-8")
+            infos += struct.pack("<Q", len(nb)) + nb
             infos += struct.pack("<I", len(t.shape))
             infos += struct.pack(f"<{len(t.shape)}Q", *t.shape)
             infos += struct.pack("<I", TYPE_IDS[t.type_name])

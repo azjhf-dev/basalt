@@ -24,6 +24,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -185,6 +186,7 @@ __global__ void __launch_bounds__(NT, 1) gemm_kernel(const __grid_constant__ Arg
             cp16z(scale_s + threadIdx.x * 4, p.a_scale + t, min(max(p.ntok - t, 0), 4) * 4);
             asm volatile("cp.async.commit_group;" ::: "memory");
             asm volatile("cp.async.wait_group 0;" ::: "memory");
+            __syncwarp();
         }
         const bool add = BF16 && p.epi == (int) Epilogue::AddBf16;
         const int fetch_at = max(first, p.k_tiles - FETCH_STAGES);
@@ -509,14 +511,17 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
         basalt::log::error("basalt", "prefill fp8: %d segments of %lld columns", nseg, (long long) w_cols);
         std::exit(1);
     }
-    static bool raised = false;
-    if (!raised) {
+    static std::atomic<bool> raised[64];   // the shared-memory opt-in is per device
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) { basalt::log::error("basalt", "prefill fp8: device %d out of range", dev); std::exit(1); }
+    if (!raised[dev].load(std::memory_order_acquire)) {
         if (cudaFuncSetAttribute(gemm_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess ||
             cudaFuncSetAttribute(gemm_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess) {
             basalt::log::error("basalt", "prefill fp8: shared-memory opt-in failed");
             std::exit(1);
         }
-        raised = true;
+        raised[dev].store(true, std::memory_order_release);
     }
     const bool bf16 = epi == Epilogue::StoreBf16 || epi == Epilogue::AddBf16;
     Args p{};

@@ -26,6 +26,8 @@ PARAM_END = f"</{enc.dsml_token}{enc.tool_parameter_tag_name}>"
 CALLS_GAP = "\n\n"                      # between the answer and the call block
 INVOKE_HEAD = re.compile(r'^' + re.escape(INVOKE_START) + r' name="([^"]*)">')
 PARAM_HEAD = re.compile(r'^' + re.escape(PARAM_START) + r' name="([^"]*)" string="(true|false)">')
+INVOKE_PREFIX = INVOKE_START + ' name="'
+PARAM_PREFIX = PARAM_START + ' name="'
 DSML_MARK = "\U000F2000"                # stands for the DSML marker while a message is rendered
 
 # the frontend's levels -> the encoder's scale (low 50, high 75, max 100, or 1-100); medium is the model's default (high)
@@ -57,17 +59,6 @@ class DeepseekTemplate:
         return text
 
 
-def _hold(text: str, tags: tuple[str, ...]) -> int:
-    """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
-    best = 0
-    for tag in tags:
-        for n in range(len(tag) - 1, best, -1):
-            if text.endswith(tag[:n]):
-                best = n
-                break
-    return best
-
-
 def _value(text: str, is_string: bool):
     if is_string:
         return text
@@ -90,7 +81,7 @@ class DeepseekParser:
         self.args: dict = {}
         self.first = True               # no argument written yet
         self.pname, self.pstring, self.pvalue = "", True, ""
-        self.calls_seen = False
+        self.block_called = False
 
     # ------------------------------------------------------------------ helpers
     def _args(self, out: list, piece: str) -> None:
@@ -115,9 +106,9 @@ class DeepseekParser:
             text = self.buf[:calls].rstrip()
             if text:
                 out.append(Event("reasoning", text))
-            self.buf, self.state = self.buf[calls + len(CALLS_START):], "call"
+            self.buf, self.state, self.sub, self.block_called = self.buf[calls + len(CALLS_START):], "call", "between", False
             return True
-        keep = _hold(self.buf, (THINK_END, CALLS_GAP + CALLS_START, CALLS_START))
+        keep = frontend.hold_back(self.buf, (THINK_END, CALLS_GAP + CALLS_START, CALLS_START))
         if len(self.buf) > keep:
             out.append(Event("reasoning", self.buf[:len(self.buf) - keep]))
             self.buf = self.buf[len(self.buf) - keep:]
@@ -129,9 +120,9 @@ class DeepseekParser:
             text = self.buf[:calls].rstrip("\n")
             if text:
                 out.append(Event("content", text))
-            self.buf, self.state = self.buf[calls + len(CALLS_START):], "call"
+            self.buf, self.state, self.sub, self.block_called = self.buf[calls + len(CALLS_START):], "call", "between", False
             return True
-        keep = _hold(self.buf, (CALLS_GAP + CALLS_START, CALLS_START))
+        keep = frontend.hold_back(self.buf, (CALLS_GAP + CALLS_START, CALLS_START))
         if len(self.buf) > keep:
             out.append(Event("content", self.buf[:len(self.buf) - keep]))
             self.buf = self.buf[len(self.buf) - keep:]
@@ -143,23 +134,25 @@ class DeepseekParser:
         if self.sub == "between":
             s = self.buf.lstrip()
             if s.startswith(CALLS_END):
-                self.buf, self.state, self.calls_seen = s[len(CALLS_END):], "content", True
+                self.buf, self.state = s[len(CALLS_END):], "content"
                 return True
             m = INVOKE_HEAD.match(s)
             if m:
                 self.call = ToolCall(name=m.group(1), arguments={})
-                self.args, self.first, self.sub = {}, True, "invoke"
+                self.args, self.first, self.sub, self.block_called = {}, True, "invoke", True
                 self.buf = s[m.end():]
                 if self.stream_tools:
                     out.append(Event("tool_start", call=self.call))
                 self._args(out, "{")
                 return True
-            if s and not (CALLS_END.startswith(s) or INVOKE_START.startswith(s) or
-                          (s.startswith(INVOKE_START) and ">" not in s)):
-                self.buf, self.state = CALLS_START + self.buf, "content"     # not a call block: it is text
-                self.sub, self.calls_seen = "between", True
-                out.append(Event("content", self.buf))
-                self.buf = ""
+            if s and not (CALLS_END.startswith(s) or INVOKE_PREFIX.startswith(s) or
+                          (s.startswith(INVOKE_PREFIX) and ">" not in s and "\n" not in s)):
+                if not self.block_called:
+                    out.append(Event("content", CALLS_START))    # not a call block: the opener is text
+                else:
+                    self.buf = s
+                self.state, self.sub = "content", "between"
+                return True
             return False
         if self.sub == "invoke":
             s = self.buf.lstrip()
@@ -176,7 +169,17 @@ class DeepseekParser:
                     self._args(out, '"')
                 self.buf, self.sub = s[m.end():], "value"
                 return True
-            return False                # a tag still arriving
+            if not s or INVOKE_END.startswith(s) or PARAM_PREFIX.startswith(s) or (
+                    s.startswith(PARAM_PREFIX) and ">" not in s and "\n" not in s):
+                return False                # a tag still arriving
+            # malformed tag or unexpected text inside an invoke: close streamed JSON (no tool_call) and recover
+            self._args(out, "}")
+            self.call = None
+            if s.startswith(CALLS_END) or CALLS_END.startswith(s) or s.startswith(INVOKE_START) or INVOKE_START.startswith(s):
+                self.buf, self.sub = s, "between"
+                return True
+            self.state, self.sub = "content", "between"
+            return True
         end = self.buf.find(PARAM_END)  # a value
         if end >= 0:
             text = self.buf[:end]
@@ -188,7 +191,7 @@ class DeepseekParser:
                 self._args(out, json.dumps(self.args[self.pname], ensure_ascii=False))
             self.buf, self.sub = self.buf[end + len(PARAM_END):], "invoke"
             return True
-        keep = _hold(self.buf, (PARAM_END,))
+        keep = frontend.hold_back(self.buf, (PARAM_END,))
         text, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
         self.pvalue += text
         if self.pstring:
@@ -223,7 +226,7 @@ class DeepseekParser:
                         self._args(out, json.dumps(self.pvalue))
                 self._args(out, "}")
                 self.call = None
-            elif self.buf.strip() and not self.calls_seen:
+            elif not self.block_called:
                 out.append(Event("content", CALLS_START + self.buf))
         elif self.buf:
             out.append(Event("reasoning" if self.state == "reasoning" else "content", self.buf))

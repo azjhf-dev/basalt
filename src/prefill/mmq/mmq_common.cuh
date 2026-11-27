@@ -25,8 +25,8 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "basalt/ggml/ggml_common.h"
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
-#error "the MMQ kernels are built for compute capability 12.0 only"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+#error "the MMQ kernels are built for compute capability 8.9 (an Ada peer) and 12.0 only"
 #endif
 
 #define WARP_SIZE 32
@@ -77,12 +77,18 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 }
 
 // Programmatic dependent launch: a kernel waits for its predecessor, or signals that the next may start.
+// Below sm_90 (an Ada peer tier) the intrinsics lower to griddepcontrol, which does not exist there: both
+// become no-ops and the host side launches these kernels the plain way.
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();
+#endif
 }
 
 static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 // Kernels that use programmatic dependent launch take no __restrict__ pointers.
@@ -204,6 +210,7 @@ MMQ_TYPE_TRAITS(GGML_TYPE_IQ2_S, QK_K, QR2_S, QI2_S, block_iq2_s);
 MMQ_TYPE_TRAITS(GGML_TYPE_IQ3_XXS, QK_K, QR3_XXS, QI3_XXS, block_iq3_xxs);
 MMQ_TYPE_TRAITS(GGML_TYPE_IQ3_S, QK_K, QR3_S, QI3_S, block_iq3_s);
 MMQ_TYPE_TRAITS(GGML_TYPE_IQ4_NL, QK4_NL, QR4_NL, QI4_NL, block_iq4_nl);
+MMQ_TYPE_TRAITS(GGML_TYPE_MXFP4, QK_MXFP4, QR_MXFP4, QI_MXFP4, block_mxfp4);
 MMQ_TYPE_TRAITS(GGML_TYPE_IQ4_XS, QK_K, QR4_XS, QI4_XS, block_iq4_xs);
 MMQ_TYPE_TRAITS(GGML_TYPE_NVFP4, QK_NVFP4, QR_NVFP4, QI_NVFP4, block_nvfp4);
 

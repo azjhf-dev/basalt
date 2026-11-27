@@ -31,6 +31,7 @@ protected:
     std::string req_bias_text{};   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
     bool req_bias_present{};
     int64_t req_gprompt{};
+    int64_t req_reply{};   ///< reply=N: the first N ids are the prompt, the rest the reply being written (no turn begins there)
     std::string req_grammar_text{};   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
     int req_cvec{};
     float req_relax{};
@@ -46,7 +47,7 @@ protected:
     bool from_text{};
     int64_t n{};
     std::unique_ptr<basalt::program::grammar::Guard> gguard{};
-    std::vector<float> grammar_bias{};
+    bool grammar_dead{};   // the grammar allowed no token: the reply ends as an error
     int64_t grammar_resamples{};
     basalt::program::PplGate* ppl{};
     bool bad{};
@@ -55,6 +56,8 @@ protected:
     bool want_cvec{};
     int slot_b{};
     bool in_slot{};
+    bool slot_swapped{};
+    bool slot_bound{};
     bool solo_req{};
     using SoloBook = Runtime::SoloBook;
     SoloBook solo_book{};
@@ -95,6 +98,7 @@ protected:
     int64_t produced_n{};
     int64_t draft_offered{};
     int64_t draft_accepted{};
+    int64_t windows{};   ///< the decode windows this run took, for DONE (the server's tokens per window)
     double decode_ms{};
     Clock::time_point d0{};
     int64_t fresh{};
@@ -115,6 +119,8 @@ protected:
     int64_t fold_p0{};
     double prompt_ms{};
     bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
+    /// The prompt, with the ids a held conversation wrote standing for the tokens that spell the same bytes.
+    void respell_prompt();
     Flow restore();
     Flow parse();
     Flow prepare_prompt();
@@ -123,6 +129,7 @@ protected:
     Flow begin_quality_gate(const std::string& base, const std::string& out, int most_rows);
     Flow read_prompt();
     virtual Flow decode() = 0;
+    bool leave_in_slot();
     Flow complete();
     template <class B> Flow decode_loop(B& b);
     virtual bool parse_begin() { return true; }

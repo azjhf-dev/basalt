@@ -35,6 +35,10 @@ class ConvLine(unittest.TestCase):
         self.assertEqual(conversation_facts(RESTORE), {"parked": 5, "bytes": 12000000000, "evictions": 1,
                                                        "restored": 187342, "restored_ms": 912.3})
 
+    def test_a_line_with_the_refused_count(self):
+        self.assertEqual(conversation_facts("CONV parked=0 bytes=0 evictions=0 refused=942"),
+                         {"parked": 0, "bytes": 0, "evictions": 0, "refused": 942})
+
     def test_a_word_that_is_not_a_number_is_skipped(self):
         self.assertEqual(conversation_facts("CONV parked=2 bytes=x"), {"parked": 2})
 
@@ -161,7 +165,7 @@ class Totals(unittest.TestCase):
         self.assertEqual(t["prompt"], sum(r["prompt_tokens"] for r in rows))
         self.assertEqual(t["reused"], 3 * n)
         self.assertAlmostEqual(t["prompt_ms"], 40.0 * n)
-        self.assertAlmostEqual(t["decode_ms"], 20.0 * n)
+        self.assertAlmostEqual(t["decode_ms"], 2 * 20.0 * n)      # two passes each (the reply closes its thinking), 20 ms a pass
         self.assertGreater(t["written"], 0)
 
 

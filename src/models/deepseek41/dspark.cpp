@@ -3,10 +3,13 @@
 // experts, the latent rotation and the Markov and confidence heads are in dspark_kernels.cu.
 //
 // The stage structure follows llama.cpp's DeepSeek-V4.1 DSpark graph (MIT, Copyright (c) 2023-2026 The ggml authors).
+#include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/core/device_copy.hpp"
 #include "models/deepseek41/dspark.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/loader.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/log.hpp"
@@ -179,14 +182,14 @@ struct DsparkDrafter::Impl {
 
     bool upload(const void* src, size_t bytes, void** dst, size_t pad = 0) {
         if (bytes == 0 || !alloc(dst, bytes + pad)) return false;
-        return cudaMemcpy(*dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        return basalt::core::device_copy(*dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
     }
 
     bool load(const core::FileRange& section, const std::string& ranking, int keep, std::string& err) {
         size_t free0 = 0, free1 = 0, total_b = 0;
-        cudaMemGetInfo(&free0, &total_b);
+        basalt::core::gpu_mem_info(&free0, &total_b);
         const bool ok = read(section, ranking, keep, err);
-        cudaMemGetInfo(&free1, &total_b);
+        basalt::core::gpu_mem_info(&free1, &total_b);
         bytes_taken = free0 > free1 ? (uint64_t) (free0 - free1) : 0;
         return ok;
     }
@@ -218,6 +221,29 @@ struct DsparkDrafter::Impl {
             err = "dspark: " + why;
             return false;
         }
+        // the weights are read in the start's one pass: each upload is an allocation and a queued read of its file range
+        core::LoadPlan* reads = main.planning();
+        if (reads == nullptr) {
+            err = "dspark: the drafter loads only while the model starts";
+            return false;
+        }
+        const int file = reads->file(section.path);
+        int dev = 0;
+        cudaGetDevice(&dev);
+        const auto queue = [&](uint64_t at, size_t bytes, void* dst) {   // file bytes `at` of the section's data to `dst`
+            core::LoadItem it;
+            it.file = file;
+            it.off = section.offset + g->data_start() + at;
+            it.bytes = bytes;
+            it.dev = dst;
+            it.device = dev;
+            reads->add(it);
+        };
+        const auto upload_t = [&](const TensorInfo& t, size_t bytes, void** dst, size_t pad = 0) {
+            if (bytes == 0 || !alloc(dst, bytes + pad)) return false;
+            queue(t.offset, bytes, *dst);
+            return true;
+        };
         for (const MetaValue& v : g->get("dflash.target_layers")->items) target_layers.push_back((int) v.u);
         mask_id = (int32_t) g->get("tokenizer.ggml.mask_token_id")->u;
 
@@ -234,7 +260,7 @@ struct DsparkDrafter::Impl {
             const TensorInfo* t = find(n);
             if (!t) return false;
             w.type = (int) t->type;
-            return upload(g->tensor_data(*t), bytes_of(*t), &w.p, t->type == kMxfp4 ? kMxfp4Pad : 0);
+            return upload_t(*t, bytes_of(*t), &w.p, t->type == kMxfp4 ? kMxfp4Pad : 0);
         };
         auto ft = [&](const std::string& n, float*& p, size_t expect) {
             const TensorInfo* t = find(n);
@@ -243,7 +269,7 @@ struct DsparkDrafter::Impl {
                 err = "dspark: " + n + " is not the expected fp32 tensor";
                 return false;
             }
-            return upload(g->tensor_data(*t), bytes_of(*t), (void**) &p);
+            return upload_t(*t, bytes_of(*t), (void**) &p);
         };
         // a stage's kept experts, and their router rows and biases, in ascending order
         const std::vector<std::vector<int>> keep = kept_experts(ranking, keep_asked);
@@ -252,10 +278,9 @@ struct DsparkDrafter::Impl {
             if (!t) return false;
             w.type = (int) t->type;
             const size_t one = bytes_of(*t) / kExperts;
-            std::vector<uint8_t> h(one * k.size());
-            const uint8_t* src = (const uint8_t*) g->tensor_data(*t);
-            for (size_t i = 0; i < k.size(); ++i) std::memcpy(h.data() + i * one, src + (size_t) k[i] * one, one);
-            return upload(h.data(), h.size(), &w.p, kMxfp4Pad);
+            if (k.empty() || !alloc(&w.p, one * k.size() + kMxfp4Pad)) return false;
+            for (size_t i = 0; i < k.size(); ++i) queue(t->offset + (uint64_t) k[i] * one, one, (uint8_t*) w.p + i * one);
+            return true;
         };
         auto rows_of = [&](const std::string& n, float*& p, size_t row_floats, const std::vector<int>& k) {
             const TensorInfo* t = find(n);
@@ -264,10 +289,10 @@ struct DsparkDrafter::Impl {
                 err = "dspark: " + n + " is not the expected fp32 tensor";
                 return false;
             }
-            std::vector<float> h(row_floats * k.size());
-            const float* src = (const float*) g->tensor_data(*t);
-            for (size_t i = 0; i < k.size(); ++i) std::memcpy(h.data() + i * row_floats, src + (size_t) k[i] * row_floats, row_floats * 4);
-            return upload(h.data(), h.size() * 4, (void**) &p);
+            const size_t row = row_floats * 4;
+            if (k.empty() || !alloc((void**) &p, row * k.size())) return false;
+            for (size_t i = 0; i < k.size(); ++i) queue(t->offset + (uint64_t) k[i] * row, row, (uint8_t*) p + i * row);
+            return true;
         };
         for (int l = 0; l < kStages; ++l) {
             Stage& s = stage[l];
@@ -311,13 +336,12 @@ struct DsparkDrafter::Impl {
             err = "dspark: the Markov tables are not bf16 rank-256";
             return false;
         }
-        if (!upload(g->tensor_data(*t1), bytes_of(*t1), (void**) &w1) || !upload(g->tensor_data(*t2), bytes_of(*t2), (void**) &w2)) {
+        if (!upload_t(*t1, bytes_of(*t1), (void**) &w1) || !upload_t(*t2, bytes_of(*t2), (void**) &w2)) {
             err = "dspark: out of device memory (Markov tables)";
             return false;
         }
 
-        // the main model's output matrix (the drafter has none of its own): read in place on its card, else staged through
-        // the host
+        // the main model's output matrix (the drafter has none of its own): read in place on its card, else copied from it
         const DevTensor* h = main.tensor("output.weight");
         if (!h) {
             err = "dspark: the main model has no output matrix";
@@ -331,21 +355,14 @@ struct DsparkDrafter::Impl {
                 err = "dspark: out of device memory (output matrix)";
                 return false;
             }
-            std::vector<char> stage_buf((size_t) std::min<uint64_t>(h->bytes, 64ull << 20));
-            for (uint64_t off = 0; off < h->bytes; off += stage_buf.size()) {
-                const size_t n = (size_t) std::min<uint64_t>(stage_buf.size(), h->bytes - off);
-                {
-                    core::OnDevice on_main(main.device());
-                    if (cudaMemcpy(stage_buf.data(), (const char*) h->ptr + off, n, cudaMemcpyDeviceToHost) != cudaSuccess) {
-                        err = "dspark: cannot copy the output matrix";
-                        return false;
-                    }
-                }
-                if (cudaMemcpy((char*) head.p + off, stage_buf.data(), n, cudaMemcpyHostToDevice) != cudaSuccess) {
-                    err = "dspark: cannot copy the output matrix";
-                    return false;
-                }
-            }
+            core::LoadItem it;   // copied from the main card once the pass has placed it there
+            it.from = (const uint8_t*) h->ptr;
+            it.from_device = main.device();
+            it.bytes = h->bytes;
+            it.dev = head.p;
+            it.device = dev;
+            it.count = 0;
+            reads->add(it);
         }
         mask_emb.resize(kN);
         if (!main.embedding_row(mask_id, mask_emb.data(), err)) return false;
@@ -397,7 +414,7 @@ struct DsparkDrafter::Impl {
         {
             std::vector<float> rows((size_t) 4 * (kT - 1) * kN);
             for (size_t r = 0; r < (size_t) 4 * (kT - 1); ++r) std::memcpy(rows.data() + r * kN, mask_emb.data(), (size_t) kN * 4);
-            if (cudaMemcpy(x_mask, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (basalt::core::device_copy(x_mask, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = "dspark: cannot upload the mask rows";
                 return false;
             }

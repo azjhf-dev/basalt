@@ -137,5 +137,124 @@ class DeepseekBudget(Budget, unittest.TestCase):
     case = DeepseekCase
 
 
+class Inkling2Budget(unittest.TestCase):
+    """Inkling 2 starts in "between" (thinks_in_blocks): pass 1 is still capped at the budget while thought == 0,
+    wraps thinking with <|end_message|>, and runs uncapped once an answer starts without thinking."""
+
+    def setUp(self):
+        from serve.models.inkling2 import END, END_TURN, HEADER, OWN_TOKENS, TEXT, THINK, Inkling2
+
+        self.END, self.END_TURN, self.HEADER, self.TEXT, self.THINK = END, END_TURN, HEADER, TEXT, THINK
+        tpl_src = (Path(__file__).resolve().parent / "fixtures/inkling2_chat_template.jinja").read_text(encoding="utf-8")
+
+        class InkTok(ByteTokenizer):
+            SPECIALS = list(OWN_TOKENS)
+
+        self.tok = InkTok()
+        self.dialect = Inkling2()
+        self.template = self.dialect.template(tpl_src)
+
+    def run_budget(self, reply_fn, budget=20):
+        tok, dialect = self.tok, self.dialect
+        caps, prompts = [], []
+
+        class Eng(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+                prompts.append(list(ids))
+                caps.append(max_new)
+                out = reply_fn(tok.decode(ids), len(prompts))
+                for t in tok.encode(out, parse_special=True)[:max_new]:
+                    if cancel.is_set():
+                        return
+                    yield t
+
+        svc = Service(Eng(tok, "x", max_context=32768), tok, self.template, dialect=dialect)
+        httpd = serve(svc, port=0)
+        try:
+            body = {"model": "basalt", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 2000,
+                    "reasoning_budget_tokens": budget}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read()), caps, prompts
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_pass1_is_capped_and_wraps_with_end_message(self):
+        H, TH, TX, E, ET = self.HEADER, self.THINK, self.TEXT, self.END, self.END_TURN
+        full = H + TH + THOUGHT + E + H + TX + ANSWER + E + ET
+
+        def script(prompt, pass_n):
+            if prompt.endswith(E) and TH in prompt:
+                return H + TX + ANSWER + E + ET
+            idx = prompt.rfind(H + TH)
+            if idx >= 0:
+                said = prompt[idx:]
+                return full[len(said):]
+            return full
+
+        code, body, caps, prompts = self.run_budget(script, budget=20)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(caps[0], 20)                           # pass 1 capped even though parser started in "between"
+        msg = body["choices"][0]["message"]
+        self.assertEqual(msg["content"], ANSWER)
+        self.assertEqual(len(msg["reasoning_content"]), 19)     # <|content_thinking|> + 19 thinking bytes = budget 20
+        self.assertTrue(self.tok.decode(prompts[-1]).endswith(THOUGHT[:19] + E))
+
+    def test_no_thinking_block_resumes_uncapped_on_pass2(self):
+        H, TX, E, ET = self.HEADER, self.TEXT, self.END, self.END_TURN
+        long_ans = "Answer " * 10
+        full = H + TX + long_ans + E + ET
+
+        def script(prompt, pass_n):
+            idx = prompt.rfind(H + TX)
+            return full[len(prompt[idx:]):] if idx >= 0 else full
+
+        code, body, caps, _ = self.run_budget(script, budget=15)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(caps[0], 15)
+        self.assertEqual(caps[1], 2000 - 15)                    # uncapped once in content
+        self.assertEqual(body["choices"][0]["message"]["content"], long_ans)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TimedEngine(ScriptEngine):
+    """ScriptEngine with a DONE line's figures per pass: the first pass decodes at 100 tok/s, the second at 1000."""
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
+        n, ms_per = 0, 10.0 if not self.prompts else 1.0
+        try:
+            for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+                n += 1
+                yield t
+        finally:
+            self.last = {"generated": n, "prompt_tokens": len(ids), "prompt_ms": 5.0, "decode_ms": ms_per * n,
+                         "finish": "stop", "reused": 0}
+
+
+class PassesRate(unittest.TestCase):
+    def test_a_request_in_two_passes_reports_both_passes_rate(self):
+        case = QwenCase
+        engine = TimedEngine(case, ANSWER)
+        svc = Service(engine, case.tok, case.template, dialect=case.dialect)
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        body = {"model": "basalt", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 2000,
+                "reasoning_budget_tokens": 20}
+        req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            self.assertEqual(r.status, 200)
+        self.assertEqual(len(engine.prompts), 2)
+        second = len(engine.prompts[1]) and engine.last["generated"]
+        r = svc.metrics()["requests"][0]
+        # 20 tokens in 200 ms, then the rest at 1 ms each: every pass's tokens over every pass's time
+        self.assertEqual(r["decode_tok_s"], round((20 + second) / ((200 + second) / 1000), 1))
+        self.assertLess(r["decode_tok_s"], 1000)
+        t = svc.metrics()["totals"]
+        self.assertEqual(t["decode_ms"], 200 + second)

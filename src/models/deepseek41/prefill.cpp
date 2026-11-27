@@ -3,6 +3,7 @@
 // Same per-layer sequence as the single-token loop (session.cpp), with every elementwise, mixing, norm, router and
 // Engram step taken over T tokens at once. Attention and the experts go through the LayerOps batch entries, which
 // keep the causal order inside the chunk.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/prefill.hpp"
 
@@ -15,7 +16,7 @@
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/ops.hpp"
 #include "models/deepseek41/prefill_ffn.hpp"
-#include "models/deepseek41/tier.hpp"
+#include "basalt/core/expert_tier.hpp"
 
 #include <cuda_runtime.h>
 
@@ -57,9 +58,9 @@ public:
         dump_dir_ = m_.diag_dump();
         ffn_ = make_prefill_ffn(m_, ops_, cap_, err);
         if (!ffn_) return false;
-        ExpertTier* tier = ops_.expert_tier(err);   // the FFN has it open by now
+        core::ExpertTier* tier = ops_.expert_tier(err);   // the FFN has it open by now
         if (!tier) return false;
-        host_ = &tier->host();
+        host_ = &m_.prompt_host();
         batch_open_ = ops_.open_batch(cap_, err);
         if (!batch_open_) return false;
         const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), 8), 1 << 16);
@@ -312,6 +313,7 @@ private:
                 const DevTensor* gw = m_.tensor(il, "engram_gate.weight");
                 if (!kvw || !gw) return fail("layer " + std::to_string(il) + " has no Engram tensors");
                 const int in = n_cols * 256;
+                if (!(ffn_ && ffn_->dense_rows(kvw->ptr, kvw->type, (int) (5 * n), in, rows_all_, T, kv_dev_, st)))
                 for (int t0 = 0; t0 < T; t0 += 8) {
                     const int nc = std::min(8, T - t0);
                     dense_f32(*kvw, rows_all_ + (size_t) t0 * in, q8_, kv_dev_ + (size_t) t0 * 5 * n, in,
@@ -406,7 +408,7 @@ private:
         if (dump_dir_.empty()) return;
         std::vector<float> h((size_t) T * width);
         cudaStreamSynchronize(stream_);
-        cudaMemcpy(h.data(), dev, h.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(h.data(), dev, h.size() * sizeof(float), cudaMemcpyDeviceToHost);
         for (int t = 0; t < T; ++t) {
             const std::string path = dump_dir_ + "/" + name + "." + std::to_string(layer) + "." +
                                      std::to_string(pos0 + t) + ".bin";

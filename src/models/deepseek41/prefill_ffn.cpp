@@ -6,6 +6,7 @@
 // experts and a share of the RAM ones, read over its own link, beside the main card (prefill::PeerShare); in a short chunk
 // the CPU also takes RAM experts with few rows. Their rows join the main card's before the weighted sum. Shared: the dense
 // matvec over columns of up to eight tokens.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/prefill_ffn.hpp"
 
@@ -21,7 +22,7 @@
 #include "models/deepseek41/layer_ops.hpp"
 #include "models/deepseek41/ops.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
-#include "models/deepseek41/tier.hpp"
+#include "basalt/core/expert_tier.hpp"
 
 #include <cuda_runtime.h>
 
@@ -84,7 +85,7 @@ public:
             if (err.empty()) err = "deepseek41: the prompt path needs the expert tier";
             return false;
         }
-        PromptHost& host = tier_->host();
+        PromptHost& host = m_.prompt_host();
         slot_ = host.slot;   // the products step from expert to expert in whole blocks of the layer's two formats
         const size_t K = (size_t) g_.n_used, n = (size_t) g_.n_embd;
         max_rows_ = prefillp::stage_rows(K, cap_);
@@ -123,15 +124,16 @@ public:
         all = routed;
         const int64_t nf = (int64_t) g_.n_ff_exp * std::max(g_.n_shared, 1);
         const std::pair<const char*, int64_t> shexp[] = {{"ffn_gate_shexp.weight", nf}, {"ffn_up_shexp.weight", nf},
-                                                         {"ffn_down_shexp.weight", g_.n_embd}};
+                                                         {"ffn_down_shexp.weight", g_.n_embd}, {"engram_kv.weight", 5 * g_.n_embd}};
         for (int il = 0; il < g_.n_layers; ++il)
             for (const auto& [name, rows] : shexp)
                 if (const DevTensor* t = m_.tensor(il, name); t && mmq::fits(t->type, rows)) add(all, t->type, rows);
         for (const auto& [t, rows] : all) mmq::load(t, rows);
-        if (tier_->peer_share()) {
-            const core::OnDevice od(tier_->peer()->device());
-            for (const auto& [t, rows] : routed) mmq::load(t, rows);
-        }
+        if (tier_->peer_share())   // every second card runs its block's prompt products
+            for (const auto& p : tier_->peers()) {
+                const core::OnDevice od(p->device());
+                for (const auto& [t, rows] : routed) mmq::load(t, rows);
+            }
         return true;
     }
 
@@ -165,7 +167,7 @@ public:
         if (ahead_) return routed_ahead(il, T, x, ids, w, out, st, err);
         std::vector<int32_t> hid((size_t) T * K);
         cudaStreamSynchronize(st);
-        cudaMemcpy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
         std::vector<std::vector<int32_t>> by((size_t) g_.n_expert);   // pair = t * K + slot
         for (int e = 0; e < T * K; ++e) {
             if (hid[(size_t) e] < 0 || hid[(size_t) e] >= g_.n_expert) {
@@ -200,7 +202,7 @@ public:
             for (int q = 0; q < nb; ++q) {
                 const int e = used[b0 + (size_t) q];
                 uint8_t* dst = B.blobs + staged_stride(el) * (size_t) q;
-                ExpertTier::Source src;
+                core::ExpertTier::Source src;
                 if (tier_) src = tier_->locate(il, e);
                 if (src.dev) {
                     cudaMemcpyAsync(dst, src.dev, L.bytes, cudaMemcpyDeviceToDevice, copy_);
@@ -321,6 +323,33 @@ public:
         return true;
     }
 
+    bool dense_rows(const void* w, int type, int rows, int cols, const float* x, int T, float* out, void* stream) override {
+        namespace mmq = basalt::prefill::mmq;
+        if (!mmq::fits(type, rows) || mmq::q8_bytes(kSharedRows, cols) > mmq::q8_bytes(max_rows_, g_.n_embd)) return false;
+        for (int t0 = 0; t0 < T; t0 += kSharedRows) {
+            const int nc = std::min(kSharedRows, T - t0);
+            const int32_t b[2] = {0, nc};
+            cudaMemcpyAsync(sbnd_, b, sizeof b, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+            mmq::quantize(x + (size_t) t0 * cols, nullptr, xq1_, type, cols, cols, nc, stream);
+            basalt::prefill::mmq::Product p;
+            p.w = w;
+            p.type = type;
+            p.w_rows = rows;
+            p.w_cols = cols;
+            p.expert_bytes = mmq::matrix_bytes(type, rows, cols);
+            p.n = 1;
+            p.xq = xq1_;
+            p.bounds = sbnd_;
+            p.ids = ident_;
+            p.total_rows = nc;
+            p.max_rows = nc;
+            p.dst = out + (size_t) t0 * rows;
+            p.ld_dst = rows;
+            ctx_.run(p, stream);
+        }
+        return true;
+    }
+
 private:
     struct Share {
         std::vector<kernels::cpu::ExpertJobMulti> jobs;
@@ -328,6 +357,7 @@ private:
         int cpu_rows = 0;
         int64_t cpu_at = 0;                      // the CPU rows' first row in the layer's rows
         bool peer = false;                       // the second card took a share
+        int layer = -1;                          // whose: the share of that layer's card joins it
         std::thread cpu_thread;
         void join() {
             if (cpu_thread.joinable()) cpu_thread.join();
@@ -366,7 +396,7 @@ private:
         end = at;
         for (size_t i = 0; i < peer.size(); ++i) {
             const int e = peer[i];
-            const ExpertTier::Source src = tier_->locate(il, e);
+            const core::ExpertTier::Source src = tier_->locate(il, e);
             for (int32_t p : by[(size_t) e]) {
                 tok[i].push_back(p / K);
                 map_h_[(size_t) p] = (int32_t) end++;
@@ -378,40 +408,35 @@ private:
             x1.n = (int) tok[i].size();
             ex.push_back(x1);
         }
-        return tier_->peer_share()->run(share_layer(il), x, T, ex, rows_ + (size_t) at * (size_t) g_.n_embd, stream, err);
+        return tier_->share_for(il)->run(share_layer(il), x, T, ex, rows_ + (size_t) at * (size_t) g_.n_embd, stream, err);
     }
 
     // The second card's experts of layer `il` in a long chunk start their staging before its routing.
     void prepare_peer(int il) {
-        if (!tier_->peer_share()) return;
+        if (!tier_->share_for(il)) return;
         std::vector<prefill::PeerShare::Expert> ex;
         for (int e = 0; e < g_.n_expert; ++e) {
             if (!on_peer_[(size_t) il][(size_t) e]) continue;
-            const ExpertTier::Source src = tier_->locate(il, e);
+            const core::ExpertTier::Source src = tier_->locate(il, e);
             prefill::PeerShare::Expert x1;
             x1.blob = src.peer ? src.peer : src.pinned;
             x1.on_peer = src.peer != nullptr;
             ex.push_back(x1);
         }
-        if (!ex.empty()) tier_->peer_share()->prepare(share_layer(il), ex);
+        if (!ex.empty()) tier_->share_for(il)->prepare(share_layer(il), ex);
     }
 
     // Of the RAM experts `ram` (highest ids first, `rows` each), how many the second card takes beside its own experts. In a
     // long chunk (`tokens` > 0) the main card's link reads ahead while the layer's attention runs.
     int peer_count(int il, const std::vector<int64_t>& ram_rows, int64_t main_rows, double main_bytes, int64_t peer_rows,
                    int tokens = 0) const {
-        const ExpertLayer& el = m_.pack().experts[(size_t) il];
-        const prefill::ShareRates& r = tier_->share_rates(il);
-        const double lead = r.sm_hz0 > 0 ? (double) tokens * prefillp::kPreRouteCycles / r.sm_hz0 : 0;
-        return prefill::peer_take(r, ram_rows, main_rows, main_bytes, peer_rows, (double) el.blob_bytes,
-                                  (double) (basalt::prefill::mmq::q8_bytes(2, g_.n_embd) - basalt::prefill::mmq::q8_bytes(1, g_.n_embd)),
-                                  4.0 * (double) g_.n_embd, lead);
+        return tier_->peer_take(il, ram_rows, main_rows, main_bytes, peer_rows, tokens, prefillp::kPreRouteCycles);
     }
 
     bool share_buffers(std::string& err) {
         if (hrows_) return true;
         (void) err;
-        const PromptHost& host = tier_->host();
+        const PromptHost& host = m_.prompt_host();
         hx_ = host.hx;
         hrows_ = host.hrows;
         act_ = host.act;
@@ -434,7 +459,7 @@ private:
         std::vector<int32_t> tok_row((size_t) T, -1);
         for (int c = 1; c <= kCpuRows; ++c) {
             for (int e : used) {
-                const ExpertTier::Source src = tier_->locate(il, e);
+                const core::ExpertTier::Source src = tier_->locate(il, e);
                 if (!src.pinned || (int) by[(size_t) e].size() != c || stays[(size_t) e]) continue;
                 if (s.cpu_rows + c > pinned - (int) s.jobs.size() - 1 || rows + c > prefillp::kShareRows) break;
                 kernels::cpu::ExpertJobMulti j;
@@ -465,7 +490,7 @@ private:
             double main_bytes = 0;
             for (int e : used) {
                 if (stays[(size_t) e]) continue;
-                const ExpertTier::Source src = tier_->locate(il, e);
+                const core::ExpertTier::Source src = tier_->locate(il, e);
                 const int64_t c = (int64_t) by[(size_t) e].size();
                 if (src.peer) {
                     peer.push_back(e);
@@ -491,11 +516,12 @@ private:
         if (!peer.empty()) {
             if (!start_peer(il, T, x, by, peer, at, at, stream, err)) return false;
             s.peer = true;
+            s.layer = il;
         }
         s.cpu_at = at;
         for (size_t i = 0; i < s.pair.size(); ++i) map_h_[(size_t) s.pair[i]] = (int32_t) (at + (int64_t) i);
         if (rows == 0) return true;
-        if (cudaMemcpy(hx_, x, (size_t) T * n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (basalt::core::device_copy(hx_, x, (size_t) T * n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
             err = "deepseek41: reading a short read's activations failed";
             return false;
         }
@@ -511,7 +537,7 @@ private:
     // The rows of the CPU and the second card join the others'.
     bool finish_share(Share& s, void* stream, std::string& err) {
         s.join();
-        if (s.peer && !tier_->peer_share()->join(stream, err)) return false;
+        if (s.peer && !tier_->share_for(s.layer)->join(stream, err)) return false;
         if (s.pair.empty()) return true;
         const size_t rows = s.pair.size(), n = (size_t) g_.n_embd;
         cudaMemcpyAsync(rows_ + (size_t) s.cpu_at * n, hrows_, rows * n * 4, cudaMemcpyHostToDevice, (cudaStream_t) stream);
@@ -531,7 +557,7 @@ private:
             int64_t main_rows = 0, peer_rows = 0;
             double main_bytes = 0;
             for (int e = NE - 1; e >= 0; --e) {
-                const ExpertTier::Source src = tier_->locate(l, e);
+                const core::ExpertTier::Source src = tier_->locate(l, e);
                 if (src.peer) {
                     on_peer_[(size_t) l][(size_t) e] = 1;
                     peer_rows += each;
@@ -559,7 +585,7 @@ private:
         pf_base_.assign((size_t) nl + 1, 0);
         for (int l = 0; l < nl; ++l) {
             for (int e = 0; e < g_.n_expert; ++e) {
-                const ExpertTier::Source src = tier_->locate(l, e);
+                const core::ExpertTier::Source src = tier_->locate(l, e);
                 if (src.dev || src.pinned || src.peer) continue;
                 pf_idx_[(size_t) l][(size_t) e] = (int32_t) pf_list_[(size_t) l].size();
                 pf_list_[(size_t) l].push_back(e);
@@ -567,7 +593,7 @@ private:
             pf_base_[(size_t) l + 1] = pf_base_[(size_t) l] + (int64_t) pf_list_[(size_t) l].size();
         }
         pf_on_ = false;
-        const PromptHost& host = tier_->host();
+        const PromptHost& host = m_.prompt_host();
         ring_ = host.ring;
         ring_pieces_ = host.ring_pieces;
         if (pf_base_.back() > 0 && ring_pieces_ < kStageExperts) return false;   // a launch's pieces must fit at once
@@ -660,7 +686,7 @@ private:
             if (e >= g_.n_expert) break;
             if (on_peer_[(size_t) l][(size_t) e]) continue;
             uint8_t* dst = D.blobs + staged_stride(el) * (size_t) q;
-            const ExpertTier::Source src = tier_->locate(l, e);
+            const core::ExpertTier::Source src = tier_->locate(l, e);
             if (src.dev) {
                 cudaMemcpyAsync(dst, src.dev, el.blob_bytes, cudaMemcpyDeviceToDevice, copy_);
             } else if (src.pinned) {
@@ -703,7 +729,7 @@ private:
         }
         std::vector<int32_t> hid((size_t) T * K);
         cudaStreamSynchronize(st);
-        cudaMemcpy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
+        basalt::core::device_copy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
         std::vector<std::vector<int32_t>> by((size_t) NE);   // pair = t * K + slot
         for (int e = 0; e < T * K; ++e) {
             if (hid[(size_t) e] < 0 || hid[(size_t) e] >= NE) {
@@ -806,7 +832,7 @@ private:
             while (issued_ < std::min<int64_t>(consumed_ + prefillp::kAheadSlots, (int64_t) run_layers_ * G))
                 if (!issue_next(err)) return false;
         }
-        if (!peer.empty() && !tier_->peer_share()->join(st, err)) return false;
+        if (!peer.empty() && !tier_->share_for(il)->join(st, err)) return false;
         cudaMemcpyAsync(map_, map_h_.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, st);
         weighted_sum_tokens(rows_, map_, w, T, K, g_.n_embd, out, st);
         return true;
@@ -891,7 +917,7 @@ private:
     const DsModel& m_;
     const Geometry& g_;
     LayerOps& ops_;
-    ExpertTier* tier_ = nullptr;
+    core::ExpertTier* tier_ = nullptr;
     bool tier_tried_ = false;
     struct Stage {
         uint8_t *blobs = nullptr, *host = nullptr;

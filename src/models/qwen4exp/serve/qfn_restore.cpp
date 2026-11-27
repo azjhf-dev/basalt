@@ -137,30 +137,6 @@ Flow QfnRequest::make_room() {
         runtime_.slot_held = SlotHeld{};
         basalt::log::warn("basalt serve", "prompt of %lld tokens refused: %s", (long long) n, runtime_.err.c_str());
         std::printf("ERR %s\n", runtime_.err.c_str());
-        std::fflush(stdout);
-        if (in_slot) {
-            if (solo_req && !runtime_.ver.bind_session(&runtime_.ss, runtime_.err)) {
-                std::printf("ERR %s\n", runtime_.err.c_str());
-                return Flow::error;
-            }
-            runtime_.rsp = &runtime_.ss;
-            runtime_.sp.set_session(runtime_.ss);
-            if (runtime_.mtp_on) runtime_.mtp.set_ple_session(&runtime_.ss);
-            runtime_.solo_out = nullptr;
-            runtime_.live = std::move(solo_book.live);
-            runtime_.live_imgs = std::move(solo_book.live_imgs);
-            runtime_.live_ok = solo_book.live_ok;
-            runtime_.cvec_cached = solo_book.cvec;
-            runtime_.checks = std::move(solo_book.checks);
-            if (solo_moved) {
-                runtime_.live.clear();
-                runtime_.live_imgs.clear();
-                runtime_.live_ok = false;
-                runtime_.checks.clear();
-            }
-            runtime_.solo_draft_back(!solo_moved);
-        }
-        runtime_.admit_slot = -1;
         return Flow::next;
     }
     if (!kv_ok) {
@@ -190,7 +166,10 @@ Flow QfnRequest::restore_image() {
                 failed_stage = runtime_.stages[i]->dev;
                 break;
             }
-            if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return Flow::error; }
+            if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess) {
+                std::printf("ERR stage sync (%s)\n", cudaGetErrorString(se));
+                return Flow::error;
+            }
         }
         if (!restored) {
             basalt::log::warn("basalt serve", "conversation cache: restoring a parked conversation failed%s "
@@ -198,7 +177,10 @@ Flow QfnRequest::restore_image() {
                          failed_stage >= 0 ? (" on CUDA" + std::to_string(failed_stage)).c_str() : "",
                          runtime_.err.c_str());
             (void) cudaGetLastError();
-            if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR restore sync\n"); return Flow::error; }
+            if (const cudaError_t se = cudaDeviceSynchronize(); se != cudaSuccess) {
+                std::printf("ERR restore sync (%s)\n", cudaGetErrorString(se));
+                return Flow::error;
+            }
             runtime_.err.clear();
             incoming.reset();
             runtime_.live.clear();

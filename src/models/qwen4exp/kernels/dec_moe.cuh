@@ -1067,6 +1067,7 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
     X(16, 20) X(17, 20) X(18, 20) X(21, 20) X(22, 20) X(23, 20) X(29, 20) X(42, 20) \
     X(16, 42) X(17, 42) X(18, 42) X(21, 42) X(22, 42) X(23, 42) X(29, 42) X(42, 42) \
     X(16, 6) X(17, 6) X(18, 6) X(21, 6) X(22, 6) X(23, 6) X(29, 6) X(42, 6) \
+    X(22, 7) X(18, 7) X(21, 7) \
     X(40, 40) X(12, 7) X(12, 8) X(13, 8) X(14, 8) X(8, 8) X(21, 8) X(23, 8)   // IQ3_S / IQ4_XS gate/up, Q8_0 down
 // the mixed gate/up layers (GU_MIX) as (gate, up, down)
 #define DM_MIX(X) X(22, 16, 42)
@@ -1397,6 +1398,10 @@ __global__ void __launch_bounds__(kDmThreads) dm_vram_kernel(const DmPlan* __res
 // dots (the same bits).  A down item waits for its group's gate/up items (counters, as dm_experts).
 constexpr int kTmaStages = 3;
 constexpr int kTmaStage = 11776;          // bytes: the largest item (32 IQ4_NL down rows, 8 IQ4_XS gate/up rows)
+// The TMA bulk-copy pipeline (mbarrier + cp.async.bulk + the cluster fence) needs sm_90: a build for an
+// older peer card compiles none of it, and the host side must not choose kind 1 there (the plain kernel
+// path below covers the same formats).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
 constexpr int kTmaGuRows = 8, kTmaDownRows = 32;
 
 struct DmTmaShared {
@@ -1529,6 +1534,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_vram_tma_kernel(const DmPlan* _
     dm_experts_tma<TG, TD>(sm, ng, xq, L, gate, up, out, sync + 1, blockIdx.x, gridDim.x, 0);
     if (dm_arrive(sync, gridDim.x, sync + 1, ng)) sync[0] = 0u;
 }
+#endif  // sm_90+ (the TMA pipeline)
 
 // ---------------------------------------------------------------- the VRAM share as three launches, NR rows a warp
 // row_dot_multi over NR rows at once: each row's sums are row_dot_multi's (the same calls, k lane-strided, added in the
@@ -1651,6 +1657,7 @@ __global__ void __launch_bounds__(256) dm_gu_kernel(const DmPlan* __restrict__ p
     }
 }
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900  // the TMA kernel exists on this build
 template<int TG, int TD>
 int dm_vram_tma_blocks() {
     static int known[64] = {};
@@ -1667,6 +1674,7 @@ int dm_vram_tma_blocks() {
     }
     return known[dev];
 }
+#endif  // the TMA kernel exists on this build
 
 template<int TG, int TD>
 int dm_vram_blocks() {

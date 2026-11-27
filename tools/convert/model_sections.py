@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import pathlib
 import re
 import struct
@@ -199,11 +200,20 @@ def convert_tensor(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool
     return "2", data, len(data), rec
 
 
+def _sha256_array(arr: np.ndarray) -> str:
+    h = hashlib.sha256()
+    chunk = 64 << 20
+    for i in range(0, arr.size, chunk):
+        h.update(arr[i:i + chunk])
+    return h.hexdigest()
+
+
 class Dense:
     """The `dense` section: `plan` validates every tensor first, `chunks` streams the pool and fills `rows` and `records`,
         `index_text` is the `dense.index`."""
 
-    def __init__(self, model: SourceModel, compat_bf16: bool = False, arch=QWEN):
+    def __init__(self, model: SourceModel, compat_bf16: bool = False, arch=QWEN, only=None):
+        """`only`: a predicate on tensor names; the tensors it rejects are not in this pool."""
         self.model = model
         self.arch = arch
         self.compat_bf16 = compat_bf16
@@ -213,13 +223,12 @@ class Dense:
         self.pool_bytes = 0
         problems = []
         for name, (g, t, p) in model.where.items():
-            if is_expert(name) or name in arch.not_in_dense:
+            if is_expert(name) or name in arch.not_in_dense or (only is not None and not only(name)):
                 continue
-            if len(t.shape) > 2:
-                raise ConvertError(f"tensor {name} has {len(t.shape)} dimensions; the index holds two")
             form = arch.form_of(name)
             # quantized tensors are served from the source unless the pool needs them dequantized (--compat-bf16)
             native = t.type_name not in FLOAT and arch.native(name, t.type_name)
+            # a row gives the first dimension and the rest flattened; meta.tensors has a served tensor's own shape
             if t.type_name not in FLOAT and not native and not compat_bf16:
                 problems.append(f"{name} is {t.type_name}, but the engine requires {form}; use --compat-bf16")
             self.todo.append((name, t, p, native))
@@ -231,7 +240,7 @@ class Dense:
         at = 0
         for name, t, p, native in self.todo:
             ne0 = int(t.shape[0])
-            ne1 = int(t.shape[1]) if len(t.shape) > 1 else 0
+            ne1 = math.prod(int(d) for d in t.shape[1:]) if len(t.shape) > 1 else 0
             if native:
                 self.rows.append([name, "0", "0", "0", "0", "0", "0", str(ne0), str(ne1), "8", "0", "32"] + ["0"] * 7)
                 continue
@@ -245,7 +254,7 @@ class Dense:
             kind, data, dst_bytes, rec = got
             if rec is not None:
                 self.records.append({"name": name, "shard": p.name, **rec,
-                                     "source_sha256": hashlib.sha256(raw.tobytes()).hexdigest()})
+                                     "source_sha256": _sha256_array(raw)})
             self.rows.append([name, "0", kind, str(at), str(len(data)), "0", str(dst_bytes), str(ne0), str(ne1),
                               "0", "0", "1"] + ["0"] * 7)
             yield data
@@ -269,20 +278,25 @@ class Dense:
 class Experts:
     """The `experts` section and its `experts.layout`; each role is resolved by name in the shard that holds it."""
 
-    def __init__(self, model: SourceModel):
+    def __init__(self, model: SourceModel, layers=None):
+        """`layers`: the layer ids that hold routed experts (default 0 .. the last layer with expert tensors); the
+            layout lists exactly these, by layer id."""
         T = {n: w[1] for n, w in model.where.items()}
         exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
         if not exps:
             raise ConvertError("the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)")
         self.model = model
-        self.n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
+        self.layers = list(layers) if layers is not None else list(range(1 + max(int(n.split(".")[1]) for n in exps)))
+        if not self.layers:
+            raise ConvertError("no layer holds routed experts")
+        self.n_layers = len(self.layers)
         # router rows = experts kept (a pruned model has fewer)
-        self.n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])
-        if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != self.n_expert for l in range(self.n_layers)):
+        self.n_expert = int(T["blk.%d.ffn_gate_inp.weight" % self.layers[0]].shape[1])
+        if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != self.n_expert for l in self.layers):
             raise ConvertError("the routers disagree on the expert count; a per-layer pruned model cannot be converted")
         self.layout = []
         offset = 0
-        for l in range(self.n_layers):
+        for l in self.layers:
             names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
             if any(n not in T for n in names):
                 raise ConvertError("layer %d: missing %s" % (l, ", ".join(n for n in names if n not in T)))
@@ -344,43 +358,82 @@ MTP_Q8 = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", 
           "mlp.shared_expert.down_proj.weight"}
 
 
+_Q2_0_FACTORS = np.linspace(0.5, 1.0, 17, dtype=np.float32)
+
+
 def q2_0(x: np.ndarray) -> np.ndarray:
     """Float32 values in blocks of 64 -> Q2_0 blocks (fp16 d, 16 bytes of 2-bit codes, code = q + 1, four per byte).
         The block scale minimizes squared error over {-1, 0, 1, 2} x d (the ggml reference uses d = max|w| and never the +2 level)."""
-    x = x.reshape(-1, 64).astype(np.float32)
-    amax = np.abs(x).max(axis=1, keepdims=True)
-    best_err = np.full((x.shape[0], 1), np.inf, dtype=np.float32)
-    best_d = np.zeros_like(amax)
-    for f in np.linspace(0.5, 1.0, 17, dtype=np.float32):      # scale search range: amax/2 .. amax
-        d = amax * f
-        inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
-        q = np.clip(np.rint(x * inv), -1, 2)
-        err = ((q * d - x) ** 2).sum(axis=1, keepdims=True)
-        better = err < best_err
-        best_err = np.where(better, err, best_err)
-        best_d = np.where(better, d, best_d)
-    d16 = best_d.astype(np.float16)
-    d = d16.astype(np.float32)                                   # quantize against the stored (fp16) scale
-    inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
-    codes = (np.clip(np.rint(x * inv), -1, 2) + 1).astype(np.uint8)
-    c = codes.reshape(-1, 16, 4)
-    packed = (c[:, :, 0] | (c[:, :, 1] << 2) | (c[:, :, 2] << 4) | (c[:, :, 3] << 6)).astype(np.uint8)
-    out = np.empty((x.shape[0], 18), dtype=np.uint8)
-    out[:, :2] = d16.view(np.uint8).reshape(-1, 2)
-    out[:, 2:] = packed
+    x = np.asarray(x, dtype=np.float32).reshape(-1, 64)
+    nb = x.shape[0]
+    if nb == 0:
+        return np.empty(0, dtype=np.uint8)
+    out = np.empty((nb, 18), dtype=np.uint8)
+    step = min(nb, 2048)
+    buf = np.empty((step, 64), dtype=np.float32)
+    d_buf = np.empty((step, 1), dtype=np.float32)
+    err_buf = np.empty((step, 1), dtype=np.float32)
+    zero, one, lo, hi = np.float32(0.0), np.float32(1.0), np.float32(-1.0), np.float32(2.0)
+    for i in range(0, nb, step):
+        j = min(i + step, nb)
+        n = j - i
+        xc, bc, dc, ec = x[i:j], buf[:n], d_buf[:n], err_buf[:n]
+        np.abs(xc, out=bc)
+        amax = bc.max(axis=1, keepdims=True)
+        best_err = np.full((n, 1), np.inf, dtype=np.float32)
+        best_d = np.zeros_like(amax)
+        for f in _Q2_0_FACTORS:                                  # scale search range: amax/2 .. amax
+            np.multiply(amax, f, out=dc)
+            inv = np.where(dc > zero, one / np.where(dc > zero, dc, one), zero)
+            np.multiply(xc, inv, out=bc)
+            np.rint(bc, out=bc)
+            np.clip(bc, lo, hi, out=bc)
+            np.multiply(bc, dc, out=bc)
+            np.subtract(bc, xc, out=bc)
+            np.square(bc, out=bc)
+            bc.sum(axis=1, keepdims=True, out=ec)
+            better = ec < best_err
+            np.copyto(best_err, ec, where=better)
+            np.copyto(best_d, dc, where=better)
+        d16 = best_d.astype(np.float16)
+        dc[:] = d16.astype(np.float32)                           # quantize against the stored (fp16) scale
+        inv = np.where(dc > zero, one / np.where(dc > zero, dc, one), zero)
+        np.multiply(xc, inv, out=bc)
+        np.rint(bc, out=bc)
+        np.clip(bc, lo, hi, out=bc)
+        np.add(bc, one, out=bc)
+        c = bc.astype(np.uint8).reshape(n, 16, 4)
+        out[i:j, :2] = d16.view(np.uint8).reshape(n, 2)
+        out[i:j, 2:] = c[:, :, 0] | (c[:, :, 1] << np.uint8(2)) | (c[:, :, 2] << np.uint8(4)) | (c[:, :, 3] << np.uint8(6))
     return out.reshape(-1)
 
 
 def q8_0(x: np.ndarray) -> bytes:
     """ggml's reference rounding over rows of a float32 array: blocks of 32, fp16 d = amax / 127."""
-    b = x.reshape(-1, 32).astype(np.float32)
-    d = np.abs(b).max(axis=1) / 127.0
-    inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0).astype(np.float32)
-    v = b * inv[:, None]
-    q = (np.sign(v) * np.floor(np.abs(v) + 0.5)).astype(np.int8)
-    out = np.empty((b.shape[0], 34), dtype=np.uint8)
-    out[:, :2] = d.astype(np.float16).view(np.uint8).reshape(-1, 2)
-    out[:, 2:] = q.view(np.uint8)
+    b = np.asarray(x, dtype=np.float32).reshape(-1, 32)
+    nb = b.shape[0]
+    if nb == 0:
+        return b""
+    out = np.empty((nb, 34), dtype=np.uint8)
+    step = min(nb, 4096)
+    v = np.empty((step, 32), dtype=np.float32)
+    a = np.empty((step, 32), dtype=np.float32)
+    zero, one, half, c127 = np.float32(0.0), np.float32(1.0), np.float32(0.5), np.float32(127.0)
+    for i in range(0, nb, step):
+        j = min(i + step, nb)
+        n = j - i
+        bc, vc, ac = b[i:j], v[:n], a[:n]
+        np.abs(bc, out=vc)
+        d = vc.max(axis=1) / c127
+        inv = np.where(d > zero, one / np.where(d > zero, d, one), zero).astype(np.float32)
+        np.multiply(bc, inv[:, None], out=vc)
+        np.abs(vc, out=ac)
+        np.add(ac, half, out=ac)
+        np.floor(ac, out=ac)
+        np.sign(vc, out=vc)
+        np.multiply(vc, ac, out=vc)
+        out[i:j, :2] = d.astype(np.float16).view(np.uint8).reshape(n, 2)
+        out[i:j, 2:] = vc.astype(np.int8).view(np.uint8)
     return out.tobytes()
 
 
@@ -389,16 +442,28 @@ def _bf16_to_f32(u16: np.ndarray) -> np.ndarray:
 
 
 def mtp_blob(gu: np.ndarray, dn: np.ndarray) -> bytes:
-    """One expert in the engine's blob layout: gu is its (1280, 40, 18) Q2_0 rows (gate 0..639, up 640..1279), dn its
-        (2560, 10, 18). Gate/up rows interleave (2r = gate r, 2r+1 = up r), then the down rows; codes of all rows in one
-        plane, fp16 scales in another."""
+    """One expert in the engine's blob layout: gu is its (2*ff, h/64, 18) Q2_0 rows (gate 0..ff-1, up ff..2*ff-1),
+        dn its (h, ff/64, 18). Gate/up rows interleave (2r = gate r, 2r+1 = up r), then the down rows; codes of all
+        rows in one plane, fp16 scales in another."""
+    ff, h = gu.shape[0] // 2, dn.shape[0]
     inter = np.empty_like(gu)
-    inter[0::2] = gu[:MTP_FF]
-    inter[1::2] = gu[MTP_FF:]
+    inter[0::2] = gu[:ff]
+    inter[1::2] = gu[ff:]
     out = b"".join([inter[:, :, 2:].tobytes(), dn[:, :, 2:].tobytes(), inter[:, :, :2].tobytes(),
                     dn[:, :, :2].tobytes()])
-    assert len(out) == 3 * (MTP_H * MTP_FF * 18 // 64), len(out)
+    assert len(out) == 3 * (h * ff * 18 // 64), len(out)
     return out
+
+
+def _mtp_expert_job(args):
+    gu_path, dn_path, h, ff, e = args
+    gu_elems = 2 * ff * h
+    dn_elems = h * ff
+    g_u16 = np.fromfile(gu_path, dtype="<u2", count=gu_elems, offset=e * gu_elems * 2)
+    d_u16 = np.fromfile(dn_path, dtype="<u2", count=dn_elems, offset=e * dn_elems * 2)
+    g = q2_0(_bf16_to_f32(g_u16)).reshape(2 * ff, h // 64, 18)
+    d = q2_0(_bf16_to_f32(d_u16)).reshape(h, ff // 64, 18)
+    return mtp_blob(g, d)
 
 
 class Mtp:
@@ -479,17 +544,22 @@ class Mtp:
     def dense_index(self) -> bytes:
         return ("\n".join(self.dense_lines) + "\n").encode("utf-8")
 
-    def expert_chunks(self):
+    @property
+    def expert_bytes(self) -> int:
+        return MTP_NE * 3 * (MTP_H * MTP_FF * 18 // 64)
+
+    def expert_chunks(self, pool=None, depth: int = 16):
         """512 blobs, one per expert; each expert is quantized to Q2_0 on its own, so the memory stays small."""
         gu_t, dn_t = (self.manifest[n] for n in MTP_EXPERTS)
         if gu_t["shape"] != [MTP_NE, 2 * MTP_FF, MTP_H] or dn_t["shape"] != [MTP_NE, MTP_H, MTP_FF]:
             raise ConvertError(f"unexpected drafter expert shapes {gu_t['shape']} {dn_t['shape']}")
-        gu = np.memmap(self.src / gu_t["file"], dtype="<u2", mode="r", shape=tuple(gu_t["shape"]))
-        dn = np.memmap(self.src / dn_t["file"], dtype="<u2", mode="r", shape=tuple(dn_t["shape"]))
-        for e in range(MTP_NE):
-            g = q2_0(_bf16_to_f32(np.asarray(gu[e]))).reshape(2 * MTP_FF, MTP_H // 64, 18)
-            d = q2_0(_bf16_to_f32(np.asarray(dn[e]))).reshape(MTP_H, MTP_FF // 64, 18)
-            yield mtp_blob(g, d)
+        gu_path, dn_path = str(self.src / gu_t["file"]), str(self.src / dn_t["file"])
+        jobs = ((gu_path, dn_path, MTP_H, MTP_FF, e) for e in range(MTP_NE))
+        if pool is not None:
+            yield from bounded_imap(pool, _mtp_expert_job, jobs, depth)
+            return
+        for j in jobs:
+            yield _mtp_expert_job(j)
 
 
 def draft_vocab_bytes(path, n_vocab: int | None = None) -> bytes:
@@ -507,7 +577,7 @@ def draft_vocab_bytes(path, n_vocab: int | None = None) -> bytes:
 PLE_DIM = 160
 
 
-def fp8_e4m3_table() -> np.ndarray:
+def _build_fp8_e4m3_table() -> np.ndarray:
     """All 256 E4M3 (finite-only, bias 7) codes as float32; the two NaN codes are NaN."""
     b = np.arange(256)
     sign = np.where(b >> 7, -1.0, 1.0)
@@ -517,12 +587,22 @@ def fp8_e4m3_table() -> np.ndarray:
     return (sign * v).astype(np.float32)
 
 
+_FP8_E4M3_TABLE = _build_fp8_e4m3_table()
+
+
+def fp8_e4m3_table() -> np.ndarray:
+    """All 256 E4M3 (finite-only, bias 7) codes as float32; the two NaN codes are NaN."""
+    return _FP8_E4M3_TABLE.copy()
+
+
 def fp8_rows_to_q8_0(raw: np.ndarray, scale: float) -> bytes:
     """Rows of PLE_DIM FP8 codes times the tensor's scale -> Q8_0 rows (5 blocks of 34 bytes each)."""
-    x = fp8_e4m3_table()[raw.reshape(-1)] * np.float32(scale)
-    if not np.isfinite(x).all():
+    with np.errstate(invalid="ignore", over="ignore"):
+        lut = _FP8_E4M3_TABLE * np.float32(scale)
+    flat = raw.reshape(-1)
+    if (~np.isfinite(lut))[flat].any():
         raise ConvertError("the FP8 table holds a non-finite value")
-    return q8_0(x)
+    return q8_0(lut[flat])
 
 
 def _ple_job(args):
@@ -568,40 +648,61 @@ def bounded_imap(pool, fn, jobs, depth: int):
 
 class PleFp8:
     """The PLE n-gram table of a checkpoint that stores it as FP8 shards (`...ngram_embedding.shard_K.weight`) with one
-    BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values."""
+    BF16 `...ngram_embedding.weight_scale`, as Q8_0 rows: values are code x scale, re-blocked per 32 values.  A release
+    that consolidates its weight files spreads the shards over several of them; they are gathered by their index."""
 
-    def __init__(self, path, chunk_rows: int = 65536):
-        self.path, self.chunk_rows = path, chunk_rows
-        head, base = read_safetensors_header(path)
-        scales = [k for k in head if k.endswith("ngram_embedding.weight_scale")]
-        if len(scales) != 1:
-            raise ConvertError(f"{path}: {len(scales)} ngram_embedding.weight_scale tensors")
-        stem = scales[0][:-len("weight_scale")]
-        sc = head[scales[0]]
-        if sc["dtype"] != "BF16" or sc["shape"] != [1]:
-            raise ConvertError(f"{path}: the PLE scale is not one BF16 value")
-        with open(path, "rb") as f:
-            f.seek(base + sc["data_offsets"][0])
-            u = np.frombuffer(f.read(2), dtype="<u2").astype(np.uint32) << 16
-        self.scale = float(u.view(np.float32)[0])
-        shards = []
-        while f"{stem}shard_{len(shards)}.weight" in head:
-            t = head[f"{stem}shard_{len(shards)}.weight"]
-            if t["dtype"] != "F8_E4M3" or len(t["shape"]) != 2 or t["shape"][1] != PLE_DIM:
-                raise ConvertError(f"{path}: shard {len(shards)} is not FP8 rows of {PLE_DIM}")
-            shards.append((base + t["data_offsets"][0], t["shape"][0]))
-        if not shards:
-            raise ConvertError(f"{path}: no PLE shards")
-        self.shards = shards
-        self.rows = sum(r for _, r in shards)
+    def __init__(self, paths, chunk_rows: int = 65536):
+        if isinstance(paths, (str, pathlib.Path)):
+            paths = [paths]
+        self.paths, self.chunk_rows = [pathlib.Path(p) for p in paths], chunk_rows
+        stem, scale, found = None, None, {}
+        for path in self.paths:
+            head, base = read_safetensors_header(path)
+            scales = [k for k in head if k.endswith("ngram_embedding.weight_scale")]
+            for k in scales:
+                if scale is not None:
+                    raise ConvertError(f"{path}: a second ngram_embedding.weight_scale")
+                sc = head[k]
+                if sc["dtype"] != "BF16" or sc["shape"] != [1]:
+                    raise ConvertError(f"{path}: the PLE scale is not one BF16 value")
+                with open(path, "rb") as f:
+                    f.seek(base + sc["data_offsets"][0])
+                    u = np.frombuffer(f.read(2), dtype="<u2").astype(np.uint32) << 16
+                scale = float(u.view(np.float32)[0])
+                stem = k[:-len("weight_scale")]
+            if stem is None:      # a file with shards but the scale in another file: its own prefix
+                heads = [k for k in head if "ngram_embedding.shard_" in k]
+                stem = heads[0][:heads[0].index("shard_")] if heads else None
+            for k, t in head.items():
+                if stem is None or not k.startswith(stem + "shard_") or not k.endswith(".weight"):
+                    continue
+                i = int(k[len(stem) + len("shard_"):-len(".weight")])
+                if i in found:
+                    raise ConvertError(f"{path}: PLE shard {i} is in two files")
+                if t["dtype"] != "F8_E4M3" or len(t["shape"]) != 2 or t["shape"][1] != PLE_DIM:
+                    raise ConvertError(f"{path}: shard {i} is not FP8 rows of {PLE_DIM}")
+                found[i] = (path, base + t["data_offsets"][0], t["shape"][0])
+        if scale is None:
+            raise ConvertError("no ngram_embedding.weight_scale in " + ", ".join(str(p) for p in self.paths))
+        if not found:
+            raise ConvertError("no PLE shards in " + ", ".join(str(p) for p in self.paths))
+        missing = sorted(set(range(max(found) + 1)) - set(found))
+        if missing:
+            raise ConvertError(f"the PLE table lacks shards {missing[:8]} of {max(found) + 1}")
+        self.scale = scale
+        self.shards = [found[i] for i in range(max(found) + 1)]
+        self.rows = sum(r for _, _, r in self.shards)
         self.row_bytes = PLE_DIM // 32 * 34
         self.nbytes = self.rows * self.row_bytes
+        self.conversion = {"src_type": "F8_E4M3", "dst_type": "Q8_0",
+                           "method": "fp8 code x per-tensor BF16 scale, Q8_0 blocks of 32 (ggml reference rounding)",
+                           "scale": self.scale}
 
     def jobs(self):
-        for off, rows in self.shards:
+        for path, off, rows in self.shards:
             for r in range(0, rows, self.chunk_rows):
                 n = min(self.chunk_rows, rows - r)
-                yield (self.path, off + r * PLE_DIM, n, self.scale)
+                yield (str(path), off + r * PLE_DIM, n, self.scale)
 
     def chunks(self, pool, depth: int = 16):
         """The Q8_0 rows in order, made on `pool` with at most `depth` chunks in flight."""
@@ -615,16 +716,33 @@ Q6K_BLOCK, Q6K_BYTES = 256, 210
 def q6_k(x: np.ndarray) -> bytes:
     """Q6_K blocks of 256 over a float32 array (length a multiple of 256): per 16-value group the least-squares
     scale from the signed-max starting grid, 8-bit group scales against one fp16 super-scale, values re-rounded
-    against the scales as stored. The layout is ggml block_q6_K."""
+    against the scales as stored. The layout is ggml block_q6_K.
+
+    Every per-group term is built by 16 explicit elementwise steps instead of a reduction over the last axis: a bulk
+    reduction can return wrong sums for these shapes, which shows up as whole 16-value groups turning to zero. The
+    elementwise form is exact and costs nothing at this width."""
     nb = x.size // Q6K_BLOCK
     x = np.ascontiguousarray(x, dtype=np.float32).reshape(nb, 16, 16)
     with np.errstate(divide="ignore", invalid="ignore"):
-        mx = np.take_along_axis(x, np.abs(x).argmax(-1)[..., None], -1)[..., 0]
+        # the signed value of the largest magnitude in each group (the first of equals, as argmax takes)
+        mx = x[:, :, 0].copy()
+        for k in range(1, 16):
+            v = x[:, :, k]
+            mx = np.where(np.abs(v) > np.abs(mx), v, mx)
         start = np.where(mx != 0, -32.0 / np.where(mx == 0, 1, mx), 0.0)
         l = np.clip(np.rint(x * start[..., None]), -32, 31)
-        den, num = (l * l).sum(-1), (x * l).sum(-1)
+        x64 = x.astype(np.float64)
+        l64 = l.astype(np.float64)
+        den = np.zeros((nb, 16))
+        num = np.zeros((nb, 16))
+        for k in range(16):
+            c, v = l64[:, :, k], x64[:, :, k]
+            den += c * c
+            num += v * c
         scale = np.where(den > 0, num / np.where(den == 0, 1, den), 0.0)
-        smax = np.take_along_axis(scale, np.abs(scale).argmax(-1)[..., None], -1)[..., 0]
+        smax = scale[:, 0].copy()
+        for g in range(1, 16):
+            smax = np.where(np.abs(scale[:, g]) > np.abs(smax), scale[:, g], smax)
         d = smax / 127.0
         d16 = d.astype(np.float16)
         sc = np.clip(np.rint(scale / np.where(d == 0, 1, d)[..., None]), -128, 127)
@@ -699,6 +817,8 @@ def _q6k_job(args):
     pack, off, ne0, row0, rows, st_path, st_off, layout = args
     raw = np.fromfile(pack, dtype=np.uint8, count=rows * ne0 // 32 * 34, offset=off + row0 * ne0 // 32 * 34)
     q8 = q8_0_values(raw).reshape(rows, ne0)
+    if not np.isfinite(q8).all():
+        raise ConvertError("a non-finite value in pack Q8_0 tensor")
     if st_path is None:
         return q6_k(q8), 0.0
     if layout is None:
@@ -711,9 +831,14 @@ def _q6k_job(args):
         else:
             u = mm[row0:row0 + rows][:, gdn_index(ne0, 0)]
     src = _bf16_to_f32(np.ascontiguousarray(u)).reshape(rows, ne0)
+    if not np.isfinite(src).all():
+        raise ConvertError("a non-finite value in BF16 source")
     step = np.abs(src).reshape(-1, 32).max(axis=1) / 127.0
     err = np.abs(q8 - src).reshape(-1, 32).max(axis=1)
-    return q6_k(src), float((err / np.maximum(step, 2e-5)).max())
+    worst = float((err / np.maximum(step, 2e-5)).max())
+    if not math.isfinite(worst):
+        raise ConvertError("a non-finite distance from pack Q8_0")
+    return q6_k(src), worst
 
 
 class DenseQ6K:
@@ -757,7 +882,7 @@ class DenseQ6K:
 
     def chunks(self, name, info, pack, gguf_off, pool):
         for blob, worst in pool.imap(_q6k_job, self.jobs(name, info, pack, gguf_off), chunksize=1):
-            self.worst = max(self.worst, worst)
-            if worst > 1.05:
+            if not (worst <= 1.05):
                 raise ConvertError(f"{name}: the BF16 source is {worst:.2f} Q8_0 steps from the pack's copy")
+            self.worst = max(self.worst, worst)
             yield blob

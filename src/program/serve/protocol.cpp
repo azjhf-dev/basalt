@@ -1,6 +1,9 @@
 // src/program/serve/protocol.cpp - protocol operations for the persistent engine.
+#include "basalt/core/gpu_mem_info.hpp"
 #include "basalt/protocol.hpp"
 #include "state.hpp"
+#include "basalt_git.h"
+#include "basalt/platform/cpu.hpp"
 
 namespace basalt::program::serve {
 
@@ -65,7 +68,45 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
 void Runtime::report_conversations(long long restored, double restored_ms) {
     if (!conversations) return;
     basalt::protocol::emit_text(basalt::protocol::conversation_line(conversations->size(), conversations->bytes(),
-                                                                    conversations->evictions(), restored, restored_ms));
+                                                                    conversations->evictions(), parking_refusals.total(),
+                                                                    restored, restored_ms));
+}
+
+bool Runtime::capture_admit(uint64_t need, uint64_t floor, basalt::core::Admission* verdict) {
+    uint64_t guard_floor = 0;
+    const bool guard_ok = basalt::platform::ram_guard_level(nullptr, &guard_floor) == basalt::platform::RamLevel::Ok;
+    const basalt::core::Admission a = basalt::core::conversation_admission(
+        guard_ok, guard_floor, basalt::core::conversation_available_memory(), need, floor);
+    if (verdict) *verdict = a;
+    return (bool) a;
+}
+
+void Runtime::refuse_parking(const basalt::core::Admission& why, const char* what, size_t tokens, uint64_t snapshot_bytes) {
+    if (parking_refusals.refused()) {
+        const bool ram = conversations && conversations->enabled();
+        basalt::log::warn("basalt serve", "conversation cache: %s refused for %zu tokens (snapshot %llu MiB): %s; %s closed "
+                          "until free RAM recovers", what, tokens,
+                          (unsigned long long) (snapshot_bytes >> 20), basalt::core::conversation_refusal(why).c_str(),
+                          ram && disk.enabled() ? "both tiers (RAM and disk)" : disk.enabled() ? "the disk tier" : "the RAM tier");
+    }
+    report_conversations();
+}
+
+void Runtime::parking_admitted() {
+    if (const uint64_t n = parking_refusals.admitted())
+        basalt::log::info("basalt serve", "conversation cache: RAM admission open again: %llu refusal%s while it was closed, "
+                          "%llu since startup", (unsigned long long) n, n == 1 ? "" : "s",
+                          (unsigned long long) parking_refusals.total());
+}
+
+bool Runtime::admit_parking(uint64_t need, uint64_t floor, const char* what, size_t tokens, uint64_t snapshot_bytes) {
+    basalt::core::Admission a;
+    if (capture_admit(need, floor, &a)) {
+        parking_admitted();
+        return true;
+    }
+    refuse_parking(a, what, tokens, snapshot_bytes);
+    return false;
 }
 
 bool Runtime::next_line(std::string& out) {
@@ -115,6 +156,7 @@ int Runtime::init_protocol() {
             basalt::core::read_range(model_file.range("tokenizer/tokenizer.json"), cj, terr) &&
             std::string_view((const char*) cj.data(), cj.size()).find("\"pre\": \"" + std::string(pre_.name) + "\"") != std::string_view::npos) {
             text_tokenizer.set_pretokenize(pre_.split);
+            text_tokenizer.set_ignore_merges(pre_.ignore_merges);
             if (text_tokenizer.load(std::string_view((const char*) vj.data(), vj.size()),
                                     std::string_view((const char*) mj.data(), mj.size()),
                                     std::string_view((const char*) tj.data(), tj.size()), terr))
@@ -177,6 +219,8 @@ int Runtime::init_protocol() {
             buf.erase(0, n);
             return true;
         };
+        // PROMPT <nbytes> [plain=a:b,...] + nbytes of text: the same, held by handle and answered at once "PROMPT
+        // <handle> <n>" (or "PROMPT ERR <why>"); the main loop never sees it.  PROMPTI [img] <ids> likewise.
         // GENT/SGENT/BGENT <...> <max_new> [k=v ...] <nbytes> [plain=a:b,...] + nbytes of UTF-8: tokenize here and hand
         // the main loop the matching GEN/SGEN/BGEN line, with "@<seq>" where the ids would be.  False: the input ends
         // inside the payload.
@@ -186,8 +230,8 @@ int Runtime::init_protocol() {
                 std::istringstream is(head_line);
                 for (std::string w; is >> w;) tk.push_back(w);
             }
-            const size_t lead = tk[0] == "GENT" ? 2 : 3;   // the command, [the slot,] max_new
-            std::string head = tk[0].substr(0, tk[0].size() - 1);
+            const size_t lead = tk[0] == "PROMPT" ? 1 : tk[0] == "GENT" ? 2 : 3;   // the command, [the slot,] max_new
+            std::string head = tk[0] == "PROMPT" ? tk[0] : tk[0].substr(0, tk[0].size() - 1);
             long long nbytes = -1;
             std::string plain_text;
             for (size_t i = 1; i < tk.size(); ++i) {
@@ -217,6 +261,14 @@ int Runtime::init_protocol() {
             std::vector<int32_t> tids;
             std::string terr;
             if (!text_tokenizer.encode(payload, true, spans, tids, terr)) { line_out = "ERR_GENT tokenizer: " + terr; return true; }
+            if (tk[0] == "PROMPT") {
+                const size_t n = tids.size();
+                const uint64_t handle = hold_prompt({std::move(tids), false});
+                std::printf("PROMPT %llu %zu\n", (unsigned long long) handle, n);
+                std::fflush(stdout);
+                line_out.clear();
+                return true;
+            }
             std::lock_guard<std::mutex> lk(gent_mu);
             const uint64_t seq = ++gent_seq;
             gent_ids[seq] = std::move(tids);
@@ -227,9 +279,24 @@ int Runtime::init_protocol() {
         while (getline_fd(l)) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
             if (l == "STOP") { stop_req.store(true); continue; }
-            if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0) {
+            if (l.rfind("PROMPTI", 0) == 0) {
+                take_prompt_ids(l);
+                continue;
+            }
+            if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0 ||
+                l.rfind("PROMPT ", 0) == 0) {
+                const bool prompt = l.rfind("PROMPT ", 0) == 0;
                 std::string rewritten;
                 const bool framed = take_text(l, rewritten);
+                if (prompt && !rewritten.empty()) {   // refused: said at once, like the answer
+                    std::printf("PROMPT ERR %s\n", rewritten.rfind("ERR_GENT ", 0) == 0 ? rewritten.c_str() + 9 : rewritten.c_str());
+                    std::fflush(stdout);
+                    rewritten.clear();
+                }
+                if (prompt) {
+                    if (!framed) break;
+                    continue;
+                }
                 l = rewritten;
                 if (!framed) {   // the input ended inside the payload: report it
                     std::lock_guard<std::mutex> lk(in_mu);
@@ -258,7 +325,7 @@ int Runtime::init_protocol() {
         // what is left once everything is allocated: a GPU filled to the brim may not fail but page, and a page-in
         // while the verify graph spins on a host flag stalls the request for good
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         const int64_t free_mib = (int64_t) (free_b >> 20);
         if (free_mib >= vram_floor_mib()) {
             basalt::log::info("basalt serve", "%lld MiB of VRAM free with everything loaded", (long long) free_mib);
@@ -278,6 +345,21 @@ int Runtime::announce() {
         std::printf("INFO eos_ids=%s\n", ends.c_str());
     }
     if (text_tokenizer_note.empty()) std::printf("INFO text_prompt=1\n");
+    {   // the build's commit, and the processors that share each L3 cache (the console's load per CCD)
+        std::string l3;
+        for (const std::vector<int>& g : basalt::platform::cpu_l3_groups()) {
+            std::string part;
+            for (size_t i = 0; i < g.size(); ++i) {
+                size_t j = i;
+                while (j + 1 < g.size() && g[j + 1] == g[j] + 1) ++j;
+                part += (part.empty() ? "" : ",") + std::to_string(g[i]) + (j > i ? "-" + std::to_string(g[j]) : "");
+                i = j;
+            }
+            l3 += (l3.empty() ? "" : ";") + part;
+        }
+        std::printf("INFO commit=%s%s%s%s\n", BASALT_BENCH_GIT, BASALT_BENCH_DIRTY ? "-dirty" : "",
+                    l3.empty() ? "" : " cpu_l3=", l3.c_str());
+    }
     if (!o.lossy.empty()) {   // the flags that change the output, for a client that labels what it measures
         std::string flags;
         for (const auto& f : o.lossy) flags += (flags.empty() ? "" : ",") + f.flag;

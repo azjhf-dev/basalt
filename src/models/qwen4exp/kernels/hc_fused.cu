@@ -3,6 +3,7 @@
 // Built WITHOUT fast math, like fused_gr.cu, so the hc arithmetic below is fused_gr.cu's expressions compiled the
 // same way.  The router part reproduces kernels built WITH fast math (the MMVF GEMV and the native top-10): those
 // operations are spelled out as the flush-to-zero PTX instructions that build emits.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -1197,7 +1198,7 @@ const DevInfo& dev_info() {
             if (d.ok) {   // distinct logits with a few ties, so the dry run takes the usual path
                 std::vector<float> f(NE);
                 for (int e = 0; e < NE; ++e) f[e] = (float) (((e * 389) % NE) / 64.0 - 4.0 + (e % 97 == 0 ? 0.0 : 0.001));
-                d.ok = cudaMemcpy(d.t10, f.data(), NE * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+                d.ok = basalt::core::device_copy(d.t10, f.data(), NE * 4, cudaMemcpyHostToDevice) == cudaSuccess;
             }
             for (int t = 0; t < MAXT && d.ok; ++t)
                 d.ok = cudaFuncSetAttribute(kKernels[0][t], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) == cudaSuccess &&
@@ -1348,8 +1349,10 @@ const void* hc8_adopt(const uint16_t* w, int rows, int cols) {
     return c.q;
 }
 
-const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, int rows, int cols) {
-    if (q == nullptr || s == nullptr || rows <= 0 || cols <= 0 || cols % G8 != 0) return nullptr;
+const void* hc8_register(const uint16_t* w, int rows, int cols, int8_t** q, uint16_t** s) {
+    *q = nullptr;
+    *s = nullptr;
+    if (rows <= 0 || cols <= 0 || cols % G8 != 0) return nullptr;
     std::lock_guard<std::mutex> lk(g_hc8_mu);
     if (w != nullptr && g_hc8.count(w)) return w;
     const int64_t n = (int64_t) rows * cols;
@@ -1364,15 +1367,12 @@ const void* hc8_upload(const uint16_t* w, const int8_t* q, const uint16_t* s, in
         return nullptr;
     }
     c.s = reinterpret_cast<uint16_t*>(c.q + n);
-    if (cudaMemcpy(c.q, q, (size_t) n, cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(c.s, s, (size_t) rows * c.srow * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
-        cudaGetLastError();
-        return nullptr;
-    }
     c.owned = w == nullptr;
     const void* key = w != nullptr ? (const void*) w : (const void*) c.q;
     g_hc8[key] = c;
     g_hc8_bytes += c.bytes;
+    *q = c.q;
+    *s = c.s;
     return key;
 }
 

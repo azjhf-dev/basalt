@@ -7,9 +7,11 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <utility>
 
 #include "basalt/log.hpp"
 
@@ -119,30 +121,43 @@ struct Plan {
     int tiles = 0, ks = 1, cps = 0, nchunks = 0, grid = 1;
 };
 
+std::atomic<int> plan_dev{-1};   // plan_device
+
+// the SM count of the device that plans (plan_device's, else the current one)
 int sm_count() {
-    static int n = [] {
-        int dev = 0, v = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev);
-        return v > 0 ? v : 1;
-    }();
-    return n;
+    static std::mutex mu;
+    static std::map<int, int> known;
+    int dev = plan_dev.load(std::memory_order_relaxed);
+    if (dev < 0) cudaGetDevice(&dev);
+    std::lock_guard<std::mutex> lock(mu);
+    const auto it = known.find(dev);
+    if (it != known.end()) return it->second;
+    int v = 0;
+    cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev);
+    return known[dev] = v > 0 ? v : 1;
 }
 
-// blocks of k that fit on the device at once (its smem allowance raised first)
+// blocks of k that fit on the planning device at once: its blocks per SM (the same on every card of the architecture,
+// read on the current one after raising the kernel's smem allowance there) times the planning device's SMs
 int resident(const Kernel& k) {
     static std::mutex mu;
-    static std::map<const void*, int> known;
-    std::lock_guard<std::mutex> lock(mu);
-    const auto it = known.find((const void*) k.fn);
-    if (it != known.end()) return it->second;
-    cudaFuncSetAttribute(k.fn, cudaFuncAttributeMaxDynamicSharedMemorySize, k.smem);
+    static std::map<std::pair<int, const void*>, int> known;   // per device and kernel: blocks per SM
+    int dev = 0;
+    cudaGetDevice(&dev);
     int per_sm = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k.fn, k.threads, k.smem);
-    check("window gemm: occupancy");
-    const int r = std::max(1, per_sm) * sm_count();
-    known[(const void*) k.fn] = r;
-    return r;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        const auto it = known.find({dev, (const void*) k.fn});
+        if (it != known.end()) {
+            per_sm = it->second;
+        } else {
+            cudaFuncSetAttribute(k.fn, cudaFuncAttributeMaxDynamicSharedMemorySize, k.smem);
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k.fn, k.threads, k.smem);
+            check("window gemm: occupancy");
+            per_sm = known[{dev, (const void*) k.fn}] = std::max(1, per_sm);
+        }
+    }
+    return per_sm * sm_count();
 }
 
 // An F8 call's warps per block (its K slices), from its shapes alone: more slices when its 16-row tiles are few
@@ -250,6 +265,8 @@ void norm_pack(const uint16_t* x, const float* w, float eps, int64_t K, int T, v
     check("window gemm: norm_pack");
 }
 
+void plan_device(int device) { plan_dev.store(device, std::memory_order_relaxed); }
+
 void workspace_need(const Call& c, std::size_t& partial_floats, std::size_t& tickets) {
     const Plan p = plan_for(c);
     partial_floats = p.ks > 1 ? (size_t) p.ks * kRows * part_rows(c) : 0;
@@ -267,11 +284,12 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
     for (int i = 0; i < c.n; ++i) {
         if (((uintptr_t) c.m[i].w & 15) != 0) refuse("unaligned matrix", c);
         if (c.fmt == Format::Nvfp4 && c.m[i].rows % 128 != 0) refuse("NVFP4 rows not a multiple of 128", c);
+        if (c.m[i].row_scales && c.fmt != Format::F8) refuse("a scale per row on a matrix other than F8", c);
     }
     const int64_t pr = part_rows(c);
     if (p.ks > 1 && ((size_t) p.ks * kRows * pr > ws.partial_floats || (size_t) p.tiles > ws.tickets_n))
         refuse("workspace too small", c);
-    const Kernel& k = kernel_for(c, T > 16 ? 4 : T > 8 ? 2 : 1);   // 8-column tiles; a row's sums are the same in any
+    const Kernel& k = kernel_for(c, T > 32 ? 8 : T > 16 ? 4 : T > 8 ? 2 : 1);   // 8-column tiles; a row's sums are the same in any
     resident(k);   // its smem allowance
     Args a{};
     int t0 = 0;
@@ -281,6 +299,7 @@ void gemm(const Call& c, const void* act, int T, const Workspace& ws, void* stre
         a.sp[i] = c.m[i].scales ? c.m[i].scales : c.m[i].w + c.m[i].rows * (c.fmt == Format::Q8 ? c.K : c.K / 2);
         a.rows[i] = c.m[i].rows;
         a.scale[i] = c.m[i].scale;
+        a.row_scales[i] = c.m[i].row_scales;
         a.y[i] = c.m[i].y;
         a.y16[i] = c.m[i].y16;
         a.ld_y[i] = c.m[i].ld_y;

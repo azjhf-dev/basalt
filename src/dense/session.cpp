@@ -1,7 +1,9 @@
 // src/dense/session.cpp - a conversation of the dense stack as a model::ModelSession.
+#include "basalt/core/device_copy.hpp"
 #include "internal.hpp"
 
 #include "basalt/core/conversation_cache.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/log.hpp"
@@ -21,122 +23,181 @@ using model::Status;
 
 Result fail(const std::string& m) { return {Status::Error, m}; }
 
-class Session final : public model::ModelSession {
+}  // namespace
+
+// One session's device state on the card of model `m` (its layers' cells and recurrent state; on the card that holds layer 0
+// also the logits, the picks and the drafter's state), on the current device.
+bool init_state(Model& m, SessionState& st, std::string& err) {
+    const Geometry& g = m.g;
+    if (cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&st.side, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&st.fork, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&st.join, cudaEventDisableTiming) != cudaSuccess) {
+        err = "cannot create a CUDA stream";
+        return false;
+    }
+    // the drafter's state, the logits and the picks on the card that holds layer 0
+    const bool head = m.lb == 0, mtp = head && m.o.drafter == Drafter::Mtp, block = head && m.o.drafter == Drafter::Block;
+    size_t blockbytes = 0;
+    if (block) {
+        const BlockDrafter& bd = m.w.dflash;
+        blockbytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
+                      (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
+    }
+    const uint64_t dev_bytes = session_bytes(g, m.o.max_context, mtp, m.o.kv_format(), m.o.kv_resident, m.lb, m.le);
+    if (!st.arena.reserve(dev_bytes + blockbytes)) {
+        err = m.o.arch + ": out of device memory for a session of " + std::to_string((long long) m.o.max_context) +
+              " cells (" + std::to_string((unsigned long long) (dev_bytes >> 20)) + " MiB); lower --max-context or --parallel";
+        return false;
+    }
+    const size_t C = (size_t) g.conv_channels(), HV = (size_t) g.gdn_v_heads;
+    st.gdn_floats = (size_t) g.gdn_state * HV * g.gdn_state + C * 3;
+    const size_t ng = (size_t) m.n_gdn;
+    if (ng) {
+        st.gdn = st.gdn_first = st.arena.take<float>(ng * st.gdn_floats);
+        st.gdn_alt = st.arena.take<float>(ng * st.gdn_floats);
+        st.rec_qkv = st.arena.take<float>(ng * kWindow * C);
+        st.rec_h = st.arena.take<float>(ng * kWindow * C);
+        st.rec_gate = st.arena.take<float>(ng * kWindow * HV);
+        st.rec_beta = st.arena.take<float>(ng * kWindow * HV);
+    }
+    const size_t cells = (size_t) m.o.max_context * g.n_kv * g.head_dim;
+    // with K/V streaming each layer keeps its first `near` cells here and the rest in page-locked host memory
+    const int64_t near_cells = resident_cells(m.o.max_context, m.o.kv_resident);
+    const size_t n_near = (size_t) near_cells * g.n_kv * g.head_dim, n_far = cells - n_near;
+    uint8_t* host = nullptr;
+    if (n_far > 0 && m.n_attn > 0) {
+        const uint64_t hb = session_host_bytes(g, m.o.max_context, m.o.kv_format(), m.o.kv_resident) / (uint64_t) g.attn_layers() * m.n_attn;
+        if (cudaHostAlloc(&st.far_host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+            cudaGetLastError();
+            st.far_host = nullptr;
+            err = m.o.arch + ": out of page-locked memory for the streamed K/V (" + std::to_string((unsigned long long) (hb >> 20)) +
+                  " MiB); raise --kv-resident or lower --max-context or --parallel";
+            return false;
+        }
+        host = (uint8_t*) st.far_host;
+    }
+    // the far cells of one layer, carved from the host block (device-mapped: the same address on the card)
+    const auto far_view = [&](kernels::KvFar& f) {
+        f.at = near_cells;
+        if (m.o.kv_int8) {
+            f.q8.k = (int8_t*) host;
+            f.q8.v = f.q8.k + n_far;
+            f.q8.ks = (uint16_t*) (f.q8.v + n_far);
+            f.q8.vs = f.q8.ks + n_far / 64;
+            host = (uint8_t*) (f.q8.vs + n_far / 64);
+        } else {
+            f.k = (uint16_t*) host;
+            f.v = f.k + n_far;
+            host = (uint8_t*) (f.v + n_far);
+        }
+    };
+    for (int i = 0; i < m.n_attn; ++i) {
+        kernels::KvInt8 q8;
+        st.far_kv.emplace_back();
+        if (n_far > 0) far_view(st.far_kv.back());
+        if (m.o.kv_int8) {
+            const bool f4 = m.o.kv_fp4;
+            q8.fp4 = f4;
+            q8.k = st.arena.take<int8_t>(kernels::kv_code_bytes(n_near, f4));
+            q8.v = st.arena.take<int8_t>(kernels::kv_code_bytes(n_near, f4));
+            q8.ks = st.arena.take<uint16_t>(kernels::kv_scale_bytes(n_near, f4) / 2);
+            q8.vs = st.arena.take<uint16_t>(kernels::kv_scale_bytes(n_near, f4) / 2);
+            st.kc.push_back(nullptr);
+            st.vc.push_back(nullptr);
+            if (!q8.vs) {
+                err = m.o.arch + ": the KV cache does not fit the session's arena";
+                return false;
+            }
+        } else {
+            st.kc.push_back(st.arena.take<uint16_t>(n_near));
+            st.vc.push_back(st.arena.take<uint16_t>(n_near));
+        }
+        st.kq.push_back(q8);
+    }
+    if (mtp) {
+        st.mtp_kc = st.arena.take<uint16_t>(cells);
+        st.mtp_vc = st.arena.take<uint16_t>(cells);
+        st.hid = st.arena.take<float>((size_t) kWindow * g.n_embd);
+        st.tail = st.arena.take<float>(g.n_embd);
+        st.chain = st.arena.take<float>(2 * (size_t) g.n_embd);
+        st.dlogits = st.arena.take<float>(g.n_vocab);
+        st.lp = st.arena.take<float>((size_t) kWindow * kernels::kLogprobStride);
+        st.win_tok = st.arena.take<int32_t>(kWindow);
+        if (!st.win_tok) {
+            err = m.o.arch + ": the drafter's buffers do not fit the session's arena";
+            return false;
+        }
+    }
+    if (block) {
+        const BlockDrafter& bd = m.w.dflash;
+        st.dctx_cap = bd.window + 256;
+        for (size_t l = 0; l < bd.layers.size(); ++l) {
+            st.dk.push_back(st.arena.take<uint16_t>((size_t) st.dctx_cap * bd.n_kv * bd.head_dim));
+            st.dv.push_back(st.arena.take<uint16_t>((size_t) st.dctx_cap * bd.n_kv * bd.head_dim));
+        }
+        st.dacc = st.arena.take<float>((size_t) kWindow * g.n_embd);
+        st.dids = st.arena.take<int32_t>(kWindow);
+        st.dconf = st.arena.take<float>(kWindow);
+        st.dq_ids = st.arena.take<int32_t>((size_t) kWindow * kDraftQ);
+        st.dq_p = st.arena.take<float>((size_t) kWindow * kDraftQ);
+        st.win_tok = st.arena.take<int32_t>(kWindow);
+        if (!st.win_tok) {
+            err = m.o.arch + ": the block drafter's buffers do not fit the session's arena";
+            return false;
+        }
+    }
+    if (head) {
+        st.logits = st.arena.take<float>((size_t) kWindow * g.n_vocab);
+        st.picks = st.arena.take<int32_t>(kWindow);
+    }
+    st.n_keep = st.arena.take<int32_t>(4);
+    if (!st.n_keep || (ng && !st.gdn) || (!st.kc.empty() && !m.o.kv_int8 && !st.vc.back())) {
+        err = m.o.arch + ": a session's buffers do not fit its arena";
+        return false;
+    }
+    if (ng && cudaMemsetAsync(st.gdn, 0, ng * st.gdn_floats * 4, st.stream) != cudaSuccess) {
+        err = "clearing the recurrent state failed";
+        return false;
+    }
+    return cudaStreamSynchronize(st.stream) == cudaSuccess;
+}
+
+// What init_state made, on the current device (the arena frees itself).
+void free_state(SessionState& st) {
+    for (auto& per_buffer : st.wg)
+        for (cudaGraphExec_t& e : per_buffer)
+            if (e) cudaGraphExecDestroy(e);
+    if (st.stream) cudaStreamDestroy(st.stream);
+    if (st.side) cudaStreamDestroy(st.side);
+    if (st.fork) cudaEventDestroy(st.fork);
+    if (st.join) cudaEventDestroy(st.join);
+    if (st.far_host) cudaFreeHost(st.far_host);
+}
+
+namespace {
+
+class Session final : public model::BatchSession {
 public:
     explicit Session(Model& m) : m_(m), g_(m.g) {}
     ~Session() override {
-        for (auto& per_buffer : st_.wg)
-            for (cudaGraphExec_t& e : per_buffer)
-                if (e) cudaGraphExecDestroy(e);
-        if (st_.stream) cudaStreamDestroy(st_.stream);
-        if (st_.side) cudaStreamDestroy(st_.side);
-        if (st_.fork) cudaEventDestroy(st_.fork);
-        if (st_.join) cudaEventDestroy(st_.join);
+        st_.peer.reset();
+        free_state(st_);
         if (done_) cudaEventDestroy(done_);
         if (h_picks_) cudaFreeHost(h_picks_);
     }
 
     bool init(std::string& err) {
-        const Geometry& g = g_;
-        if (cudaStreamCreateWithFlags(&st_.stream, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaStreamCreateWithFlags(&st_.side, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaEventCreateWithFlags(&st_.fork, cudaEventDisableTiming) != cudaSuccess ||
-            cudaEventCreateWithFlags(&st_.join, cudaEventDisableTiming) != cudaSuccess) {
-            err = "cannot create a CUDA stream";
-            return false;
-        }
         drafter_ = m_.o.drafter == Drafter::Mtp;
         block_ = m_.o.drafter == Drafter::Block;
-        size_t block_bytes = 0;
-        if (block_) {
-            const BlockDrafter& bd = m_.w.dflash;
-            block_bytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
-                          (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
-        }
-        if (!st_.arena.reserve(session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8) + block_bytes)) {
-            err = m_.o.arch + ": out of device memory for a session of " + std::to_string((long long) m_.o.max_context) +
-                  " cells (" + std::to_string((unsigned long long) (session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8) >> 20)) +
-                  " MiB); lower --max-context or --parallel";
-            return false;
-        }
-        const size_t C = (size_t) g.conv_channels(), HV = (size_t) g.gdn_v_heads;
-        st_.gdn_floats = (size_t) g.gdn_state * HV * g.gdn_state + C * 3;
-        const size_t ng = (size_t) g.gdn_layers();
-        if (ng) {
-            st_.gdn = st_.gdn_first = st_.arena.take<float>(ng * st_.gdn_floats);
-            st_.gdn_alt = st_.arena.take<float>(ng * st_.gdn_floats);
-            st_.rec_qkv = st_.arena.take<float>(ng * kWindow * C);
-            st_.rec_h = st_.arena.take<float>(ng * kWindow * C);
-            st_.rec_gate = st_.arena.take<float>(ng * kWindow * HV);
-            st_.rec_beta = st_.arena.take<float>(ng * kWindow * HV);
-        }
-        const size_t cells = (size_t) m_.o.max_context * g.n_kv * g.head_dim;
-        for (int i = 0; i < g.attn_layers(); ++i) {
-            kernels::KvInt8 q8;
-            if (m_.o.kv_int8) {
-                q8.k = st_.arena.take<int8_t>(cells);
-                q8.v = st_.arena.take<int8_t>(cells);
-                q8.ks = st_.arena.take<uint16_t>(cells / 64);
-                q8.vs = st_.arena.take<uint16_t>(cells / 64);
-                st_.kc.push_back(nullptr);
-                st_.vc.push_back(nullptr);
-                if (!q8.vs) {
-                    err = m_.o.arch + ": the KV cache does not fit the session's arena";
-                    return false;
-                }
-            } else {
-                st_.kc.push_back(st_.arena.take<uint16_t>(cells));
-                st_.vc.push_back(st_.arena.take<uint16_t>(cells));
-            }
-            st_.kq.push_back(q8);
-        }
-        if (drafter_) {
-            st_.mtp_kc = st_.arena.take<uint16_t>(cells);
-            st_.mtp_vc = st_.arena.take<uint16_t>(cells);
-            st_.hid = st_.arena.take<float>((size_t) kWindow * g.n_embd);
-            st_.tail = st_.arena.take<float>(g.n_embd);
-            st_.chain = st_.arena.take<float>(2 * (size_t) g.n_embd);
-            st_.dlogits = st_.arena.take<float>(g.n_vocab);
-            st_.lp = st_.arena.take<float>((size_t) kWindow * kernels::kLogprobStride);
-            st_.win_tok = st_.arena.take<int32_t>(kWindow);
-            if (!st_.win_tok) {
-                err = m_.o.arch + ": the drafter's buffers do not fit the session's arena";
-                return false;
-            }
-        }
-        if (block_) {
-            const BlockDrafter& bd = m_.w.dflash;
-            st_.dctx_cap = bd.window + 256;
-            for (size_t l = 0; l < bd.layers.size(); ++l) {
-                st_.dk.push_back(st_.arena.take<uint16_t>((size_t) st_.dctx_cap * bd.n_kv * bd.head_dim));
-                st_.dv.push_back(st_.arena.take<uint16_t>((size_t) st_.dctx_cap * bd.n_kv * bd.head_dim));
-            }
-            st_.dacc = st_.arena.take<float>((size_t) kWindow * g.n_embd);
-            st_.dids = st_.arena.take<int32_t>(kWindow);
-            st_.dconf = st_.arena.take<float>(kWindow);
-            st_.win_tok = st_.arena.take<int32_t>(kWindow);
-            if (!st_.win_tok) {
-                err = m_.o.arch + ": the block drafter's buffers do not fit the session's arena";
-                return false;
-            }
-        }
-        st_.logits = st_.arena.take<float>((size_t) kWindow * g.n_vocab);
-        st_.picks = st_.arena.take<int32_t>(kWindow);
-        st_.n_keep = st_.arena.take<int32_t>(4);
-        if (!st_.n_keep || (ng && !st_.gdn) || (!st_.kc.empty() && !m_.o.kv_int8 && !st_.vc.back())) {
-            err = m_.o.arch + ": a session's buffers do not fit its arena";
-            return false;
-        }
-        if (ng && cudaMemsetAsync(st_.gdn, 0, ng * st_.gdn_floats * 4, st_.stream) != cudaSuccess) {
-            err = "clearing the recurrent state failed";
-            return false;
-        }
+        if (!init_state(m_, st_, err)) return false;
+        if (m_.split && !split_session(m_, st_, err)) return false;
         if (cudaHostAlloc((void**) &h_picks_, kWindow * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess) {
             err = "out of page-locked memory";
             return false;
         }
         lp_scratch_.resize(1);
-        return cudaStreamSynchronize(st_.stream) == cudaSuccess;
+        return true;
     }
 
     int max_window() const override {
@@ -161,13 +222,13 @@ public:
             } join{*this};
             if (Result s = settle(pos, true); !s.ok()) return s;
             std::string err;
-            // a wide block drafts the whole window whatever was asked: its drafts cost about one pass at any count, and
-            // the policy picks the window from their chances
+            // a block's drafts cost about one pass at any count, so it offers all of them whatever was asked (a wide
+            // block the whole window) and the policy picks the window from their chances
             n = wide_ ? max_window() - 1 : std::clamp(n, 1, max_window() - 1);
             const int width = block_width(n);
             if (pos + width > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
             if (!block_draft(m_, st_, anchor, pos, width, err)) return fail(err);
-            n_draft_ = std::min(n, width - 1);
+            n_draft_ = std::min(width - 1, max_window() - 1);
             return {};
         }
         if (!drafter_) return {Status::NotImplemented, m_.o.arch + ": no drafter is loaded"};
@@ -210,9 +271,10 @@ public:
         std::string err;
         // the blocks in passes of at most a batch window's rows, in order
         std::vector<int> nn((size_t) count), width((size_t) count);
+        // a slot's next window shares the batch's rows: no more drafts than its share takes
+        const int share = std::max(1, std::min(max_window(), kBatch / count) - 1);
         for (int i = 0; i < count; ++i) {
-            // a slot's next window shares the batch's rows: no more drafts than its share takes
-            nn[(size_t) i] = std::clamp(n[i], 1, std::max(1, std::min(max_window(), kBatch / count) - 1));
+            nn[(size_t) i] = std::clamp(n[i], 1, share);
             width[(size_t) i] = ss[(size_t) i]->block_width(nn[(size_t) i]);
             if (pos[i] + width[(size_t) i] > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
         }
@@ -226,11 +288,11 @@ public:
         cudaEventRecord(done_, s0);
         for (int i = 1; i < count; ++i) cudaStreamWaitEvent(sts[(size_t) i]->stream, done_, 0);
         for (int i = 0; i < count; ++i) ss[(size_t) i]->join_commit();   // the sessions' commits ran side by side
-        for (int i = 0; i < count; ++i) ss[(size_t) i]->n_draft_ = std::min(nn[(size_t) i], width[(size_t) i] - 1);
+        for (int i = 0; i < count; ++i) ss[(size_t) i]->n_draft_ = std::min(share, width[(size_t) i] - 1);   // all the block's, as solo
         return {};
     }
 
-    Result draft_end(int32_t* ids, float* conf, int max_n, int& n) override {
+    Result draft_end(int32_t* ids, float* conf, int max_n, int& n, const DraftNeed&) override {
         if (block_) {
             n = std::min(n_draft_, max_n);
             if (cudaMemcpyAsync(ids, st_.dids, (size_t) n * sizeof(int32_t), cudaMemcpyDeviceToHost, st_.stream) != cudaSuccess ||
@@ -280,68 +342,105 @@ public:
 
     int batch_rows() const override { return kBatch; }
 
-    // Several sessions' windows as one batch: each is settled and its draw prepared as decode_window does, the rows run
-    // together on the first session's stream (every session's own stream is idle by then), each session draws from its own
-    // logits.
-    Result decode_batch(model::ModelSession* const* peers, const model::DecodeRequest* reqs, int n) override {
-        if (n == 1) return peers[0]->decode_window(reqs[0]);
-        std::vector<Session*> ss((size_t) n);
-        std::vector<int32_t> tokens, pos3;
-        std::vector<BatchSeg> segs((size_t) n);
-        int rows = 0;
-        for (int i = 0; i < n; ++i) {
-            ss[(size_t) i] = dynamic_cast<Session*>(peers[i]);
-            const model::DecodeRequest& r = reqs[i];
-            if (!ss[(size_t) i] || &ss[(size_t) i]->m_ != &m_) return fail(m_.o.arch + ": a batch of sessions of another model");
-            if (r.n_tokens < 1 || r.n_tokens > kWindow) return fail(m_.o.arch + ": a decode window of " + std::to_string(r.n_tokens) + " rows");
-            if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the window passes the context");
-            rows += r.n_tokens;
+protected:
+    // ---- several sessions' windows as one batch, on model/batch_driver.hpp: each session is settled (its commit on its side
+    // stream, all of them side by side) and its draw prepared as decode_window does, the rows run together on the first
+    // session's stream, each session draws from its own logits
+
+    const char* batch_name() const override { return m_.o.arch.c_str(); }
+    int64_t batch_context() const override { return m_.o.max_context; }
+    model::BatchShared& batch_shared() override { return m_.batch; }
+    cudaStream_t batch_stream() const override { return st_.stream; }
+    // a layer split's forward runs its two cards' graphs itself (forward_batch)
+    bool batch_captured() const override { return !m_.split; }
+
+    bool batch_reserve(const model::DecodeRequest& r, std::string& err) override {
+        if (r.n_tokens < 1 || r.n_tokens > kWindow) {
+            err = "a decode window of " + std::to_string(r.n_tokens) + " rows";
+            return false;
         }
-        if (rows > kBatch) return fail(m_.o.arch + ": a batch of " + std::to_string(rows) + " rows");
-        for (int i = 0; i < n; ++i)
-            if (Result s = ss[(size_t) i]->settle(reqs[i].pos, true); !s.ok()) return s;   // the commits run side by side
-        for (int i = 0; i < n; ++i) ss[(size_t) i]->join_commit();
-        for (int i = 0; i < n; ++i)
-            if (cudaStreamSynchronize(ss[(size_t) i]->st_.stream) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
-        std::string err;
-        const cudaStream_t s = ss[0]->st_.stream;
-        for (int i = 0; i < n; ++i) {
-            Session& se = *ss[(size_t) i];
-            const model::DecodeRequest& r = reqs[i];
-            const int T = r.n_tokens;
-            if (!se.prepare_draw(r, err)) return fail(err);
-            tokens.insert(tokens.end(), r.tokens, r.tokens + T);
-            for (int t = 0; t < T; ++t) {
-                const int32_t p = (int32_t) (r.pos + t + se.st_.rope_delta);
-                pos3.insert(pos3.end(), {p, p, p});
-            }
-            if (se.drafter_) cudaMemcpyAsync(se.st_.win_tok, r.tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-            segs[(size_t) i] = {&se.st_, T, r.pos};
+        if (Result s = settle(r.pos, true); !s.ok()) {
+            err = s.message;
+            return false;
         }
-        if (!forward_batch(m_, segs.data(), n, tokens.data(), pos3.data(), err)) return fail(err);
-        for (int i = 0; i < n; ++i) {
-            Session& se = *ss[(size_t) i];
-            const model::DecodeRequest& r = reqs[i];
-            const int T = r.n_tokens;
-            se.draw(T, s);
-            se.pend_pos_ = r.pos;
-            se.pend_T_ = T;
-            if (r.logits) cudaMemcpyAsync(r.logits, se.st_.logits + (size_t) (T - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, s);
-            cudaMemcpyAsync(se.h_picks_, se.st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, s);
+        join_commit();
+        if (st_.peer && cudaStreamSynchronize(st_.peer->stream) != cudaSuccess) {
+            err = cudaGetErrorString(cudaGetLastError());
+            return false;
         }
-        if (cudaStreamSynchronize(s) != cudaSuccess) return fail(m_.o.arch + ": " + cudaGetErrorString(cudaGetLastError()));
-        for (int i = 0; i < n; ++i) {
-            Session& se = *ss[(size_t) i];
-            const model::DecodeRequest& r = reqs[i];
-            if (r.row_tokens) std::copy(se.h_picks_, se.h_picks_ + r.n_tokens, r.row_tokens);
-            if (r.next_token) *r.next_token = se.h_picks_[r.n_tokens - 1];
-        }
-        return {};
+        return prepare_draw(r, err);
     }
 
+    static BatchSeg seg_of(const model::BatchView& v, int i) {
+        Session& se = *static_cast<Session*>(v.ss[i]);
+        return {&se.st_, v.w.segs[(size_t) i].rows, v.w.segs[(size_t) i].pos0};
+    }
+
+    // every row's token and rope position (its session's offset), the drafter's window tokens; the composition is the key
+    void batch_pack(const model::BatchView& v, std::vector<BatchSeg>& segs, std::vector<int32_t>& pos3) const {
+        segs.resize((size_t) v.n);
+        pos3.clear();
+        for (int i = 0; i < v.n; ++i) {
+            segs[(size_t) i] = seg_of(v, i);
+            const SessionState& st = *segs[(size_t) i].st;
+            for (int t = 0; t < segs[(size_t) i].T; ++t) {
+                const int32_t p = (int32_t) (segs[(size_t) i].pos + t + st.rope_delta);
+                pos3.insert(pos3.end(), {p, p, p});
+            }
+        }
+    }
+
+    bool batch_stage(const model::BatchView& v, model::GraphLru<core::CapturedGraph>::Key&, std::string&) override {
+        for (int i = 0; i < v.n; ++i) {
+            Session& se = *static_cast<Session*>(v.ss[i]);
+            if (se.drafter_)
+                cudaMemcpyAsync(se.st_.win_tok, v.reqs[i].tokens, (size_t) v.reqs[i].n_tokens * sizeof(int32_t), cudaMemcpyHostToDevice, v.stream);
+        }
+        if (m_.split) return true;   // forward_batch stages both cards
+        std::vector<BatchSeg> segs;
+        std::vector<int32_t> pos3;
+        batch_pack(v, segs, pos3);
+        stage_batch(m_, segs.data(), v.n, v.w.tokens.data(), pos3.data());
+        return true;
+    }
+
+    bool batch_forward(const model::BatchView& v, std::string& err) override {
+        std::vector<BatchSeg> segs;
+        std::vector<int32_t> pos3;
+        batch_pack(v, segs, pos3);
+        if (m_.split) return forward_batch(m_, segs.data(), v.n, v.w.tokens.data(), pos3.data(), err);
+        batch_body(m_, segs.data(), v.n);
+        return true;
+    }
+
+    void batch_take(const model::BatchView& v, int i) override {
+        const model::DecodeRequest& r = v.reqs[i];
+        pend_pos_ = r.pos;
+        pend_T_ = r.n_tokens;
+        if (r.logits) cudaMemcpyAsync(r.logits, st_.logits + (size_t) (r.n_tokens - 1) * g_.n_vocab, (size_t) g_.n_vocab * 4, cudaMemcpyDeviceToHost, v.stream);
+    }
+
+    const int32_t* batch_draw(const model::BatchView& v, int i, std::string&) override {
+        const int T = v.reqs[i].n_tokens;
+        draw(T, v.stream);
+        cudaMemcpyAsync(h_picks_, st_.picks, (size_t) T * sizeof(int32_t), cudaMemcpyDeviceToHost, v.stream);
+        return h_picks_ + (T - v.head[i]);   // the driver reads the window's last head[i] rows
+    }
+
+public:
     Result prefill_chunk(const model::PrefillRequest& r) override {
         if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the prompt passes the context");
         if (Result s = settle(r.pos); !s.ok()) return s;
+        if (m_.split && !drafter_) {   // the layer split: the chunks pipelined over the two cards
+            std::string err;
+            if (!split_read(m_, st_, r.tokens, r.n_tokens, r.pos, r.progress, r.stop, err)) return fail(err);
+            return {};
+        }
+        if (m_.prompt_split) {   // a long prompt across the cards (the prompt split)
+            std::string err;
+            if (prompt_split_read(*m_.prompt_split, m_, st_, r.tokens, r.n_tokens, r.pos, r.progress, r.stop, err)) return {};
+            if (!err.empty()) return fail(err);
+        }
         std::vector<int32_t> pos3;
         for (int at = 0; at < r.n_tokens;) {
             const int n = std::min(kChunk, r.n_tokens - at);
@@ -420,7 +519,7 @@ public:
     static constexpr size_t kHeadBytes = 4 * sizeof(int64_t);
     size_t block_ring_bytes() const { return (size_t) st_.dctx_cap * m_.w.dflash.n_kv * m_.w.dflash.head_dim * sizeof(uint16_t); }
     size_t running_bytes() const override {
-        return kHeadBytes + (size_t) g_.gdn_layers() * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
+        return kHeadBytes + (size_t) (m_.n_gdn + (st_.peer ? m_.split_model->n_gdn : 0)) * st_.gdn_floats * 4 + (drafter_ ? (size_t) g_.n_embd * 4 : 0) +
                (block_ ? st_.dk.size() * 2 * block_ring_bytes() : 0);
     }
 
@@ -435,7 +534,7 @@ public:
             s.head.assign(kHeadBytes, 0);
         }
         s.regions.clear();
-        if (const size_t n = (size_t) g_.gdn_layers() * st_.gdn_floats * 4) s.regions.push_back({st_.gdn, n});
+        if (const size_t n = (size_t) m_.n_gdn * st_.gdn_floats * 4) s.regions.push_back({st_.gdn, n});
         if (drafter_) s.regions.push_back({st_.tail, (size_t) g_.n_embd * 4});
         if (block_)
             for (size_t l = 0; l < st_.dk.size(); ++l) {
@@ -443,6 +542,12 @@ public:
                 s.regions.push_back({st_.dv[l], block_ring_bytes()});
             }
         s.stream = st_.stream;
+        s.peer_regions.clear();
+        if (st_.peer) {   // the second card's layers' state
+            if (const size_t n = (size_t) m_.split_model->n_gdn * st_.gdn_floats * 4) s.peer_regions.push_back({st_.peer->gdn, n});
+            s.peer_stream = st_.peer->stream;
+            s.peer_device = m_.split_dev;
+        }
         return {};
     }
 
@@ -461,39 +566,70 @@ public:
         return {};
     }
 
+    // No cache to lend: all it holds is state the driver moves to host memory. Both cards' work is finished first.
+    Result set_low_memory(bool, int64_t&) override {
+        cudaStreamSynchronize(st_.stream);
+        if (st_.peer) cudaStreamSynchronize(st_.peer->stream);
+        return {};
+    }
+
     // a layer's cells: fp16 K and V (format 1), or int8 codes with fp16 scales per 64 values (format 2); the MTP
     // drafter's own layer is fp16 and comes last
     size_t row_bytes(bool int8) const { return (size_t) g_.n_kv * g_.head_dim * (int8 ? 1 : 2); }
+    // a quantized cache's code bytes per position, and how many code bytes one scale byte covers (int8: 32, NVFP4: 8)
+    size_t q_row() const { return kernels::kv_code_bytes((size_t) g_.n_kv * g_.head_dim, m_.o.kv_fp4); }
+    size_t q_per_scale() const { return m_.o.kv_fp4 ? 8 : 32; }
+    // the format a parked conversation's layer records: fp16 1, int8 2, NVFP4 3
+    int q_format() const { return m_.o.kv_fp4 ? 3 : 2; }
+    // the conversation's attention layers: the main card's, then the second card's (a layer split); kv_state maps i to its
+    // card's state and its index there
+    size_t kv_layers() const { return st_.kc.size() + (st_.peer ? st_.peer->kc.size() : 0); }
+    const SessionState& kv_state(size_t& i) const {
+        if (i < st_.kc.size()) return st_;
+        i -= st_.kc.size();
+        return *st_.peer;
+    }
     size_t cells_bytes(int64_t positions) const override {
-        const size_t main = m_.o.kv_int8 ? 2 * (row_bytes(true) + row_bytes(true) / 32) : 2 * row_bytes(false);
-        return (size_t) positions * ((size_t) g_.attn_layers() * main + (drafter_ ? 2 * row_bytes(false) : 0));
+        const size_t main = m_.o.kv_int8 ? 2 * (q_row() + q_row() / q_per_scale()) : 2 * row_bytes(false);
+        return (size_t) positions * (kv_layers() * main + (drafter_ ? 2 * row_bytes(false) : 0));
     }
 
     Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         cudaStreamSynchronize(st_.stream);
+        if (st_.peer) cudaStreamSynchronize(st_.peer->stream);
         kv.clear();
-        const auto down = [&](const void* dev, core::ConversationBuffer& to, size_t bytes) {
+        // a layer's array: its first `split` bytes on the card (`dev`), the rest streamed (`far`, host memory)
+        const auto down = [&](const void* dev, const void* far_buf, size_t split, core::ConversationBuffer& to, size_t bytes) {
             to.resize_for_overwrite(bytes);
             return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
-                return cudaMemcpy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+                const size_t a = at < split ? std::min(n, split - at) : 0;
+                return (a == 0 || basalt::core::device_copy(p, (const uint8_t*) dev + at, a, cudaMemcpyDeviceToHost) == cudaSuccess) &&
+                       (a == n || basalt::core::device_copy(p + a, (const uint8_t*) far_buf + (at + a - split), n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
-        for (size_t i = 0; i < st_.kc.size() + (drafter_ ? 1 : 0); ++i) {
-            const bool mtp = i == st_.kc.size();
+        for (size_t i = 0; i < kv_layers() + (drafter_ ? 1 : 0); ++i) {
+            const bool mtp = i == kv_layers();
+            size_t j = i;
+            const SessionState& ls = mtp ? st_ : kv_state(j);
+            const core::OnDevice on(&ls == &st_ ? -1 : m_.split_dev);
             const bool int8 = !mtp && m_.o.kv_int8;
             core::ConversationKv k;
-            k.format = int8 ? 2 : 1;
+            k.format = int8 ? q_format() : 1;
             k.cells = positions;
             k.heads = g_.n_kv;
             k.head_dim = g_.head_dim;
             k.page_size = 1;
-            const size_t rows = (size_t) positions * row_bytes(int8);
+            const size_t rows = (size_t) positions * (int8 ? q_row() : row_bytes(false));
+            const kernels::KvFar f = mtp ? kernels::KvFar{} : ls.far_kv[j];
+            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * (int8 ? q_row() : row_bytes(false));
             bool ok;
             if (int8) {
-                const kernels::KvInt8& q = st_.kq[i];
-                ok = down(q.k, k.k, rows) && down(q.v, k.v, rows) && down(q.ks, k.k_scale, rows / 32) && down(q.vs, k.v_scale, rows / 32);
+                const kernels::KvInt8& q = ls.kq[j];
+                ok = down(q.k, f.q8.k, split, k.k, rows) && down(q.v, f.q8.v, split, k.v, rows) &&
+                     down(q.ks, f.q8.ks, split / q_per_scale(), k.k_scale, rows / q_per_scale()) &&
+                     down(q.vs, f.q8.vs, split / q_per_scale(), k.v_scale, rows / q_per_scale());
             } else {
-                ok = down(mtp ? st_.mtp_kc : st_.kc[i], k.k, rows) && down(mtp ? st_.mtp_vc : st_.vc[i], k.v, rows);
+                ok = down(mtp ? st_.mtp_kc : ls.kc[j], f.k, split, k.k, rows) && down(mtp ? st_.mtp_vc : ls.vc[j], f.v, split, k.v, rows);
             }
             if (!ok) return fail("reading the KV cells back failed");
             kv.push_back(std::move(k));
@@ -503,26 +639,36 @@ public:
 
     Result restore_cells(const std::vector<core::ConversationKv>& kv, int64_t positions) override {
         cudaStreamSynchronize(st_.stream);
-        if (kv.size() != st_.kc.size() + (drafter_ ? 1 : 0)) return fail(m_.o.arch + ": a parked conversation has other caches");
+        if (st_.peer) cudaStreamSynchronize(st_.peer->stream);
+        if (kv.size() != kv_layers() + (drafter_ ? 1 : 0)) return fail(m_.o.arch + ": a parked conversation has other caches");
         if (positions > m_.o.max_context) return fail(m_.o.arch + ": a parked conversation is longer than the context");
-        const auto up = [&](void* dev, const core::ConversationBuffer& from, size_t bytes) {
+        const auto up = [&](void* dev, void* far_buf, size_t split, const core::ConversationBuffer& from, size_t bytes) {
             return from.size() >= bytes && from.visit(0, bytes, [&](const uint8_t* p, size_t n, size_t at) {
-                return cudaMemcpy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
+                const size_t a = at < split ? std::min(n, split - at) : 0;
+                return (a == 0 || basalt::core::device_copy((uint8_t*) dev + at, p, a, cudaMemcpyHostToDevice) == cudaSuccess) &&
+                       (a == n || basalt::core::device_copy((uint8_t*) far_buf + (at + a - split), p + a, n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
         for (size_t i = 0; i < kv.size(); ++i) {
-            const bool mtp = i == st_.kc.size();
+            const bool mtp = i == kv_layers();
+            size_t j = i;
+            const SessionState& ls = mtp ? st_ : kv_state(j);
+            const core::OnDevice on(&ls == &st_ ? -1 : m_.split_dev);
             const bool int8 = !mtp && m_.o.kv_int8;
             const core::ConversationKv& k = kv[i];
-            if (k.format != (int8 ? 2 : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
+            if (k.format != (int8 ? q_format() : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
                 return fail(m_.o.arch + ": a parked conversation has other caches");
-            const size_t rows = (size_t) positions * row_bytes(int8);
+            const size_t rows = (size_t) positions * (int8 ? q_row() : row_bytes(false));
+            const kernels::KvFar f = mtp ? kernels::KvFar{} : ls.far_kv[j];
+            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * (int8 ? q_row() : row_bytes(false));
             bool ok;
             if (int8) {
-                const kernels::KvInt8& q = st_.kq[i];
-                ok = up(q.k, k.k, rows) && up(q.v, k.v, rows) && up(q.ks, k.k_scale, rows / 32) && up(q.vs, k.v_scale, rows / 32);
+                const kernels::KvInt8& q = ls.kq[j];
+                ok = up(q.k, f.q8.k, split, k.k, rows) && up(q.v, f.q8.v, split, k.v, rows) &&
+                     up(q.ks, f.q8.ks, split / q_per_scale(), k.k_scale, rows / q_per_scale()) &&
+                     up(q.vs, f.q8.vs, split / q_per_scale(), k.v_scale, rows / q_per_scale());
             } else {
-                ok = up(mtp ? st_.mtp_kc : st_.kc[i], k.k, rows) && up(mtp ? st_.mtp_vc : st_.vc[i], k.v, rows);
+                ok = up(mtp ? st_.mtp_kc : ls.kc[j], f.k, split, k.k, rows) && up(mtp ? st_.mtp_vc : ls.vc[j], f.v, split, k.v, rows);
             }
             if (!ok) return fail(m_.o.arch + ": a parked conversation has other caches");
         }
@@ -544,6 +690,7 @@ public:
         kernels::SamplerParams sp = sampling_;
         sp.logit_bias = d_mask_;
         sp.counter += (uint64_t) row;
+        sp.n_drawn = 0;   // the row is drawn again under the mask, whatever its draft was
         kernels::sample_tokens(st_.logits + (size_t) row * g_.n_vocab, 1, g_.n_vocab,
                                history_len_ > 0 ? d_hist_ + (size_t) row * history_len_ : nullptr, history_len_, sp,
                                st_.picks, st_.stream);
@@ -571,13 +718,13 @@ public:
 
     Result copy_logits(int row, float* out) override {
         cudaStreamSynchronize(st_.stream);
-        if (cudaMemcpy(out, st_.logits + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        if (basalt::core::device_copy(out, st_.logits + (size_t) row * g_.n_vocab, (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
             return fail("the logits copy failed");
         return {};
     }
 
     std::string info_words() const override {
-        const std::string kv = m_.o.kv_int8 ? "kv=int8" : "kv=fp16";
+        const std::string kv = m_.o.kv_fp4 ? "kv=nvfp4" : m_.o.kv_int8 ? "kv=int8" : "kv=fp16";
         // a dense model has no routed experts, so none can sit on the SSD (the community check reads this)
         // host_weight_bytes: model weights held in host RAM, none for the dense stack (the community check refuses a row if
         // any). gpu_weight_bytes is what the load log calls "GiB on the GPU". The token embedding and the --vision dynamic encoder wait in host RAM by design and are told apart.
@@ -592,7 +739,11 @@ private:
     // The last window's accepted rows go into the recurrent state once the next call says where it starts.
     void join_commit() {
         if (!commit_pending_) return;
-        cudaStreamWaitEvent(st_.stream, st_.join, 0);
+        if (m_.n_gdn) cudaStreamWaitEvent(st_.stream, st_.join, 0);
+        if (st_.peer && m_.split_model->n_gdn) {
+            const core::OnDevice on(m_.split_dev);
+            cudaStreamWaitEvent(st_.peer->stream, st_.peer->join, 0);
+        }
         commit_pending_ = false;
     }
     // `defer`: the commit's join is left to the caller (join_commit), which queues work beside it first
@@ -604,13 +755,20 @@ private:
             st_.dctx_from = 0;
             wide_ = false;
             st_.alt_ready = false;
-            if (g_.gdn_layers() &&
-                cudaMemsetAsync(st_.gdn, 0, (size_t) g_.gdn_layers() * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
+            if (m_.n_gdn &&
+                cudaMemsetAsync(st_.gdn, 0, (size_t) m_.n_gdn * st_.gdn_floats * 4, st_.stream) != cudaSuccess)
                 return fail("clearing the recurrent state failed");
+            if (SessionState* p = st_.peer.get()) {
+                const core::OnDevice on(m_.split_dev);
+                p->alt_ready = false;
+                if (cudaMemsetAsync(p->gdn, 0, (size_t) m_.split_model->n_gdn * p->gdn_floats * 4, p->stream) != cudaSuccess)
+                    return fail("clearing the recurrent state failed");
+            }
             return {};
         }
         if (pend_T_ == 0) {
             st_.alt_ready = false;
+            if (st_.peer) st_.peer->alt_ready = false;
             return {};
         }
         const int64_t n = pos - pend_pos_;
@@ -621,13 +779,24 @@ private:
         wide_ = n >= std::max(2, m_.w.dflash.block - 2);
         const bool swap = st_.alt_ready && T == 1 && n == 1;
         st_.alt_ready = false;
-        if (swap) std::swap(st_.gdn, st_.gdn_alt);   // the window left its state after the row: nothing to commit
-        if (g_.gdn_layers() && n > 0 && !swap) {
-            cudaEventRecord(st_.fork, st_.stream);
-            cudaStreamWaitEvent(st_.side, st_.fork, 0);
-            commit_window(m_, st_, (int) n, st_.side);
-            cudaEventRecord(st_.join, st_.side);
-            commit_pending_ = true;
+        // the window left its state after the row: nothing to commit (on both cards of a split, which ran it alike)
+        if (swap) std::swap(st_.gdn, st_.gdn_alt);
+        if (SessionState* p = st_.peer.get(); p && swap) std::swap(p->gdn, p->gdn_alt);
+        if (st_.peer) st_.peer->alt_ready = false;
+        if (n > 0 && !swap) {
+            const auto commit = [&](Model& m, SessionState& s) {
+                if (m.n_gdn == 0) return;
+                cudaEventRecord(s.fork, s.stream);
+                cudaStreamWaitEvent(s.side, s.fork, 0);
+                commit_window(m, s, (int) n, s.side);
+                cudaEventRecord(s.join, s.side);
+                commit_pending_ = true;
+            };
+            commit(m_, st_);
+            if (st_.peer) {
+                const core::OnDevice on(m_.split_dev);
+                commit(*m_.split_model, *st_.peer);
+            }
             if (!defer) join_commit();
         }
         if (block_ && n > 0) {   // the kept rows become the block drafter's context
@@ -655,7 +824,8 @@ private:
             owned_.emplace_back(v);
             dev = (float*) v;
         }
-        if (cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
+        // on the sampling stream itself: a plain cudaMemcpy does not order against it, so a draw could read the previous bias
+        if (cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, st_.stream) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
         return true;
     }
 
@@ -677,10 +847,25 @@ private:
         if (r.sampling != nullptr) sampling_ = *r.sampling;
         sampling_.logit_bias = bias_on_ ? d_bias_ : nullptr;
         history_len_ = r.history != nullptr ? r.history_len : 0;
-        if (!sampling_.greedy && kernels::sampler_list_len(sampling_.top_k, g_.n_vocab) > kernels::kSamplerNarrowMax &&
-            !kernels::sampler_wide_reserve(g_.n_vocab, st_.stream)) {
+        const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+        const bool narrow = kernels::sampler_list_len(sampling_.top_k, g_.n_vocab) <= kernels::kSamplerNarrowMax;
+        if (sampled && !narrow && !kernels::sampler_wide_reserve(g_.n_vocab, st_.stream)) {
             err = "out of device memory for the sampler";
             return false;
+        }
+        // Speculative sampling: on the narrow lists the block drafter draws its drafts from its own distribution and a
+        // window of them keeps each by min(1, p / q), else draws the residual (sampler.hpp): the tokens are distributed as
+        // the model's, and a drafter that spreads its guesses like the model keeps more of them than its best guesses would.
+        // Greedy requests, the wide lists and a request with its own seed keep the drafter's best candidates and the
+        // plain draws.
+        st_.dtemp = block_ && sampled && narrow && sampling_.draw_drafts ? sampling_.temperature : 0.0f;
+        st_.dseed = sampling_.seed;
+        if (r.drawn_drafts && st_.dtemp > 0.0f && r.n_tokens > 1) {
+            sampling_.drafts = st_.dids;
+            sampling_.q_ids = st_.dq_ids;
+            sampling_.q_p = st_.dq_p;
+            sampling_.q_n = m_.w.dflash.top_k;
+            sampling_.n_drawn = r.n_tokens - 1;
         }
         if (history_len_ > 0) {
             if (history_len_ > kHistoryCap) history_len_ = kHistoryCap;
@@ -690,7 +875,7 @@ private:
                 owned_.emplace_back(v);
                 d_hist_ = (int32_t*) v;
             }
-            if (cudaMemcpy(d_hist_, r.history, (size_t) r.n_tokens * r.history_len * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (basalt::core::device_copy(d_hist_, r.history, (size_t) r.n_tokens * r.history_len * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = "the penalty history upload failed";
                 return false;
             }

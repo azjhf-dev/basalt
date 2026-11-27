@@ -25,6 +25,13 @@ class Levels(unittest.TestCase):
                                    "basalt-bench: warning: NVML is unavailable"),
                          ["info", "warn", "err", "err", "info", "warn"])
 
+    def test_a_stamp_before_the_line_changes_nothing(self):
+        self.assertEqual(self.read("11-26 09:15:02 basalt serve: warning: low", "11-26 09:15:03 basalt serve: ready",
+                                   "11-26 09:15:04 Traceback (most recent call last):", "11-26 09:15:04   File x", "11-26 09:15:04 ValueError: x", "11-26 09:15:05 basalt serve: ready"),
+                         ["warn", "info", "err", "err", "err", "info"])
+        e = engine_line("11-26 09:15:02 basalt serve: warning: low")
+        self.assertEqual((e.tag, e.level, e.text), ("basalt serve", "warn", "low"))
+
     def test_older_engine_markers(self):
         self.assertEqual(self.read("basalt error: boom", "basalt warning: slow disk"), ["err", "warn"])
 
@@ -75,6 +82,28 @@ class Levels(unittest.TestCase):
 
 
 class Buffer(unittest.TestCase):
+    def test_stream_pages_without_skipping_and_reports_overflow(self):
+        b = LogBuffer(capacity=4)
+        for i in range(6):
+            b.add("srv", str(i))
+        first = b.snapshot(0, 2)
+        self.assertTrue(first["dropped"])
+        self.assertEqual([x["id"] for x in first["lines"]], [3, 4])
+        self.assertEqual((first["next"], first["last"]), (4, 6))
+        second = b.snapshot(first["next"], 2, first["instance_id"])
+        self.assertFalse(second["dropped"])
+        self.assertEqual([x["id"] for x in second["lines"]], [5, 6])
+        self.assertEqual([x["id"] for x in b.snapshot(None, 2)["lines"]], [5, 6])
+
+    def test_stream_restart_detected_even_after_ids_catch_up(self):
+        b = LogBuffer()
+        for i in range(10):
+            b.add("srv", str(i))
+        data = b.snapshot(2, 3, "previous-server")
+        self.assertTrue(data["reset"])
+        self.assertEqual([x["id"] for x in data["lines"]], [8, 9, 10])
+        self.assertTrue(b.snapshot(99, 3)["reset"])
+
     def test_ids_lines_and_fields(self):
         b = LogBuffer()
         b.add("srv", "one\ntwo\n\n   \nthree")
@@ -178,6 +207,48 @@ class Tail(unittest.TestCase):
             log.write_text("hello\n", encoding="utf-8")
             self.wait_for(b, 1)
             self.assertEqual(b.since(0)[0][0]["msg"], "hello")
+
+    def test_on_line_reports_exact_byte_offsets(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "events.log"
+            log.write_text("before\n", encoding="utf-8")
+            b = LogBuffer()
+            seen = []
+            threading.Thread(target=tail_file, args=(b, str(log), "eng", 0.02),
+                             kwargs={"on_line": lambda text, pos: seen.append((text, pos))}, daemon=True).start()
+            time.sleep(0.1)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("basalt serve: warning: hot\n")
+            self.wait_for(b, 1)
+            self.assertEqual(seen, [("basalt serve: warning: hot", log.stat().st_size)])
+
+    def test_crlf_lines_strip_cr_and_keep_byte_offsets(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "crlf.log"
+            log.write_bytes(b"before\r\n")
+            b = LogBuffer()
+            seen = []
+            threading.Thread(target=tail_file, args=(b, str(log), "eng", 0.02),
+                             kwargs={"on_line": lambda text, pos: seen.append((text, pos))}, daemon=True).start()
+            time.sleep(0.1)
+            with open(log, "ab") as f:
+                f.write(b"basalt serve: warning: hot\r\n")
+            self.wait_for(b, 1)
+            self.assertEqual(seen, [("basalt serve: warning: hot", len(b"before\r\nbasalt serve: warning: hot\r\n"))])
+            self.assertEqual(b.since(0)[0][0]["msg"], "basalt serve: warning: hot")
+
+    def test_skip_omits_matching_lines_from_buffer(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "skip.log"
+            log.write_text("", encoding="utf-8")
+            b = LogBuffer()
+            threading.Thread(target=tail_file, args=(b, str(log), "eng", 0.02),
+                             kwargs={"skip": lambda line: line.startswith("basalt load: cuda0 ")}, daemon=True).start()
+            time.sleep(0.1)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("basalt load: cuda0 100 200\nbasalt: system: Linux\n")
+            self.wait_for(b, 1)
+            self.assertEqual([x["msg"] for x in b.since(0)[0]], ["basalt: system: Linux"])
 
 
 class Tty(io.StringIO):

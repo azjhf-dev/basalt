@@ -37,24 +37,17 @@ bool checkpoint_restore(const ConvCheckpoint& c, basalt::core::SessionState& ss,
 uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeometry& g) {
     using basalt::core::conversation_store_hash;
     char num[512];
-    std::snprintf(num, sizeof num, " rope %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g cvec %d %d %d %d", o.rope_scale,
-                  o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx, o.yarn_ext_factor, o.yarn_attn_factor,
-                  o.yarn_beta_fast, o.yarn_beta_slow, o.cvec_first, o.cvec_last, o.cvec_mode, o.cvec_single);
+    std::snprintf(num, sizeof num, " rope %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g cvec %d %d %d %d", o.rope.scale,
+                  o.rope.freq_base, o.rope.freq_scale, o.rope.orig_ctx, o.rope.ext_factor, o.rope.attn_factor,
+                  o.rope.beta_fast, o.rope.beta_slow, o.cvec_first, o.cvec_last, o.cvec_mode, o.cvec_single);
     std::string text = std::string("basalt conversation state kv ") + o.kv + " rope " +
-                       o.rope_scaling + num + " mtp " + o.mtp + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
+                       o.rope.type + num + " mtp " + o.mtp + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
     for (const auto& [path, scale] : o.cvec_files) text += " cvec " + path + " " + std::to_string(scale);
     uint64_t h = conversation_store_hash(text.data(), text.size(), 1);
     const int64_t geo[] = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_v_heads, g.n_head_kv,
                            g.head_dim, g.idx_key_dim, g.n_expert, g.n_ff};
     h = conversation_store_hash(geo, sizeof geo, h);
     return basalt::core::conversation_store_hash_file(o.model, h);
-}
-
-// A capture of a conversation's state, or a read of one from disk, takes `need` bytes of RAM: only while the RAM
-// guard reads its level as ok, and with `floor` left free after it (the disk tier's floor sits above the guard's).
-bool QfnRuntime::capture_admit(uint64_t need, uint64_t floor) {
-    return basalt::platform::ram_guard_level() == basalt::platform::RamLevel::Ok &&
-           basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), need, floor);
 }
 
 // Save only on a switch/rewind, not on each continuing request. No graph
@@ -160,9 +153,8 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
                                                   disk.enabled() ? disk_floor : 0);
         const size_t retained = reuse.bytes() + stage_retained;
         const size_t additional = estimate > retained ? estimate - retained : 0;
-        if (!capture_admit(additional, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable, or RAM below the guard)",
-                         additional >> 20, (long long) o.conversation_cache_min_free_mib);
+        if (basalt::core::Admission why; !capture_admit(additional, floor, &why)) {
+            refuse_parking(why, "parking", live.size(), estimate);
             return true;
         }
         basalt::core::SavedConversation image;
@@ -173,7 +165,10 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
         for (size_t k = 0; k < n_st; ++k) {   // the later stages
             auto& st = stages[k];
             const basalt::core::OnDevice on(st->dev);
-            if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+            if (const cudaError_t ce = cudaDeviceSynchronize(); ce != cudaSuccess) {
+                err = std::string("stage sync failed: ") + cudaGetErrorString(ce);
+                return false;
+            }
             const basalt::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
             basalt::core::SavedConversation part;
             if (!basalt::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
@@ -181,10 +176,11 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
                 return false;
             image.stage_images.push_back(std::move(part));
         }
-        if (!basalt::core::conversation_memory_admit(basalt::core::conversation_available_memory(), 0, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)");
+        if (basalt::core::Admission why; !capture_admit(0, floor, &why)) {
+            refuse_parking(why, "parking (after the capture)", live.size(), image.bytes());
             return true;
         }
+        parking_admitted();
         const size_t snapshot_bytes = image.bytes();
         const bool stored = to_disk ? disk.put(std::move(image), kDiskQueueCap)
                                     : conversations->put(std::move(image), held);
@@ -278,11 +274,7 @@ size_t QfnRuntime::spill_to_disk(bool at_exit, size_t limit) {
             return;
         }
         if (at_exit) disk.flush();   // one image in RAM at a time
-        if (!capture_admit(bytes, floor)) {
-            basalt::log::info("basalt serve", "conversation cache: %zu tokens not written to disk (physical RAM "
-                              "admission)", ids.size());
-            return;
-        }
+        if (!admit_parking(bytes, floor, "disk write", ids.size(), bytes)) return;
         try {
             const auto t0 = Clock::now();
             basalt::core::SavedConversation image;

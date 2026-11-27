@@ -1,3 +1,5 @@
+#include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
 
@@ -15,9 +17,8 @@ int weights(Context& context) {
     auto& hc8_names = *context.hc8_names;
     auto& pool_bytes = *context.pool_bytes;
 
-    // ---- the bytes this start places, once, from the model file's tables: the dense weights, the 8-bit copies, the
-    // draft layer, the head and every expert (the GPU cache plus its complement in RAM).  Each term is the total its own
-    // load phase reports.  A layer split places bytes per stage: no total, the progress lines stand alone.
+    // ---- the model's bytes from the model file's tables: the dense weights, the 8-bit copies, the draft layer, the head
+    // and every expert (what the RAM and VRAM checks below weigh; the start's total is what its pass places).
     uint64_t model_bytes = 0, expert_total_bytes = 0, cuda0_fixed_bytes = 0;   // the latter: all but the cache fill
     for (int64_t l = 0; l < g.n_layers; ++l)
         expert_total_bytes += (uint64_t) g.n_expert * basalt::kernels::cpu::expert_layout().blob_bytes(l);
@@ -34,27 +35,23 @@ int weights(Context& context) {
             return 1;
         }
     }
-    if (!multi_gpu) {
-        uint64_t dense_bytes = 0, mtp_bytes = 0, head_bytes = 0;
-        std::set<std::string> index_names;
-        for_each_index_name(pack_files.index, [&](const std::string& n) { index_names.insert(n); });
-        const bool planned =
-            basalt::core::NativeDense::plan_bytes(o.native_shards, true, 0, -1, dense_bytes, err) &&
-            basalt::core::NativeHead::plan_bytes(o.native_shards, head_bytes, err) &&
-            (o.mtp.empty() || o.spec < 2 ||
-             basalt::core::MtpDrafter::plan_bytes(basalt::core::MtpFiles::from(srcs), g, mtp_bytes, err));
-        if (planned) {
-            cuda0_fixed_bytes = pool_bytes + dense_bytes + head_bytes + mtp_bytes +
-                                basalt::core::Verifier::hc8_plan_bytes(
-                                    [&](const std::string& n) { return index_names.count(n) > 0; }, g);
-            model_bytes = cuda0_fixed_bytes + expert_total_bytes;
-            basalt::core::LoadProgress::announce_total(model_bytes);
-            // the experts' places follow once the cache is sized; with the arena every expert goes to RAM first
-            basalt::core::LoadProgress::plan("cuda0", cuda0_fixed_bytes);
-            if (!o.mmap_experts) basalt::core::LoadProgress::plan("ram", expert_total_bytes);
-        } else {
-            basalt::log::warn("basalt generate", "load total not computed: %s", err.c_str());
-        }
+    uint64_t dense_bytes = 0, mtp_bytes = 0, head_bytes = 0;
+    std::set<std::string> index_names;
+    for_each_index_name(pack_files.index, [&](const std::string& n) { index_names.insert(n); });
+    const bool planned =
+        basalt::core::NativeDense::plan_bytes(o.native_shards, true, 0, -1, dense_bytes, err) &&
+        basalt::core::NativeHead::plan_bytes(o.native_shards, head_bytes, err) &&
+        (o.mtp.empty() || o.spec < 2 ||
+         basalt::core::MtpDrafter::plan_bytes(basalt::core::MtpFiles::from(srcs), g, mtp_bytes, err));
+    if (planned) {
+        // a layer split loads each stage's layers (the dense bytes partition) and the drafter's own copy of the head
+        const bool draft_head = multi_gpu && !o.mtp.empty() && o.spec >= 2;
+        cuda0_fixed_bytes = pool_bytes + dense_bytes + head_bytes + (draft_head ? head_bytes : 0) + mtp_bytes +
+                            basalt::core::Verifier::hc8_plan_bytes(
+                                [&](const std::string& n) { return index_names.count(n) > 0; }, g);
+        model_bytes = cuda0_fixed_bytes + expert_total_bytes;
+    } else {
+        basalt::log::warn("basalt generate", "the model's size not computed: %s", err.c_str());
     }
     void* arena = nullptr;
     if (const cudaError_t ce = cudaMalloc(&arena, pool_bytes); ce != cudaSuccess) {
@@ -62,7 +59,7 @@ int weights(Context& context) {
         // missing is held by something else: say how much was free
         cudaGetLastError();
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        basalt::core::gpu_mem_info(&free_b, &total_b);
         basalt::log::error("basalt generate", "cudaMalloc(%llu) for the weight arena failed (%s): %llu MiB of %llu "
                              "MiB VRAM free on this GPU. The arena is allocated first, before the KV and expert "
                              "caches: another program (or an engine that is still exiting) holds the rest - "
@@ -79,21 +76,21 @@ int weights(Context& context) {
         return s;
     };
     basalt::core::WeightTable wt;
-    if (!wt.load(pack_files, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (!wt.load(pack_files, arena, pool_bytes, err, skip.empty() ? nullptr : &skip, true, context.reads)) {
         return fatal_start_error(err);
     }
     // every tensor's shape and engine form against what the kernels read (skipped rows keep their metadata)
     if (!basalt::core::check_all(wt, g, err)) {
         return fatal_start_error(o.model + ": " + err);
     }
-    basalt::log::info("basalt generate", "%llu MiB of weights loaded from %s in %.1f s (%zu tensors "
+    basalt::log::info("basalt generate", "%llu MiB of weights from %s laid out in %.1f s (%zu tensors "
                          "skipped: served from the source tensors)",
                  (unsigned long long) (pool_bytes >> 20), o.model.c_str(), load_s(), skip.size());
     if (!hc8_names.empty()) {
         // the matrices held only as 8-bit copies are registered from the model file's table
         for (const std::string& n : hc8_names) {
             const basalt::core::WeightRef* r0 = wt.find(n);
-            const void* q = r0 ? basalt::core::hc8_table_adopt(n, nullptr, (int) r0->ne1, (int) r0->ne0) : nullptr;
+            const void* q = r0 ? basalt::core::hc8_table_adopt(n, nullptr, (int) r0->ne1, (int) r0->ne0, *context.reads) : nullptr;
             if (q == nullptr || !wt.rebind(n, q)) {
                 basalt::log::error("basalt generate", "hc8: no 8-bit copy of %s", n.c_str());
                 return 1;
@@ -102,7 +99,7 @@ int weights(Context& context) {
         for (const auto& kv : wt.all())   // the injections stay bf16 in the arena, with copies beside them
             if (kv.first.ends_with("_inject.weight") && kv.first.find(".hc_") != std::string::npos && kv.second.data &&
                 basalt::core::hc8_table_adopt(kv.first, (const uint16_t*) kv.second.data, (int) kv.second.ne1,
-                                              (int) kv.second.ne0) == nullptr) {
+                                              (int) kv.second.ne0, *context.reads) == nullptr) {
                 basalt::log::error("basalt generate", "hc8: no 8-bit copy of %s", kv.first.c_str());
                 return 1;
             }
@@ -113,7 +110,7 @@ int weights(Context& context) {
 
     basalt::core::NativeDense native_dense;
     {
-        if (!native_dense.load(o.native_shards, wt, err, true)) {
+        if (!native_dense.load(o.native_shards, wt, err, true, 0, -1, nullptr, 0, context.reads)) {
             basalt::log::error("basalt generate", "native dense projections: %s", err.c_str());
             return 1;
         }
@@ -134,7 +131,7 @@ int weights(Context& context) {
         for (int64_t c = 0; c < cells; ++c)
             mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
         if (cudaMalloc(&d_mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
-            cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
+            basalt::core::device_copy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                 cudaSuccess) {
             basalt::log::error("basalt generate", "cannot allocate the image position table");
             return 1;

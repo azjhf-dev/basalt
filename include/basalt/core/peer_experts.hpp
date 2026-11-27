@@ -30,6 +30,8 @@
 
 namespace basalt::core {
 
+class LoadPlan;
+
 /// multi-GPU: set once at startup when a peer device is configured (--peer-device N).  The mapped host buffers
 /// the peer card writes into are then allocated with cudaHostAllocPortable; without a peer the flag stays off.
 void set_peer_portable(bool on);
@@ -42,26 +44,27 @@ public:
     PeerExperts(const PeerExperts&) = delete;
     PeerExperts& operator=(const PeerExperts&) = delete;
 
-    /// Opens the tier on `device`: fills it with the first pairs of `ranked` that `primary` does not hold, as many
-    /// as fit in the card's free memory minus `reserve_mib` (`max_slots` > 0 caps the count).  `exclusive`: no
-    /// other tier holds these experts, so the fill is reported as model bytes placed, not as a copy.
+    /// Opens the tier on `device` with the first pairs of `ranked` that `primary` does not hold, as many as fit in the
+    /// card's free memory minus `reserve_mib` (`max_slots` > 0 caps the count); their copies are queued in `reads`.
     bool open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
               ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, int reserve_mib,
-              int64_t max_slots, std::string& err, bool exclusive = false);
+              int64_t max_slots, LoadPlan& reads, std::string& err);
     /// `open` in two steps, for several peers sharing out one ranking: `prepare` takes the card's buffers (no slots),
-    /// `fill` sizes the slots for exactly `pick` and copies those experts in.
+    /// `fill` sizes the slots for exactly `pick` and queues those experts' copies in `reads`.
     bool prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, std::string& err);
-    bool fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive = false);
+    bool fill(const std::vector<std::pair<int32_t, int32_t>>& pick, LoadPlan& reads, std::string& err);
+    /// Once the queued copies have landed: the first slot read back and compared with its expert's bytes.
+    bool verify_fill(std::string& err);
     /// A tier whose owner keeps the experts' places and fills the slots itself: no expert source, no adaptation.
     /// `rows`: the pinned, portable, mapped host rows a share lands in; a share's activations are pinned, portable
-    /// and mapped too.
+    /// and mapped too. A null `rows`: the card writes into the `out` of each launch, never into an armed share's rows.
     bool open_plain(int device, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, float* rows, std::string& err);
     /// The device bytes free for expert slots.
     uint64_t room() const;
-    /// Slots of the given sizes; `admit` says which expert each holds and `fill_slot` copies it in (any thread).
+    /// Slots of the given sizes; `admit` says which expert each holds and the loader writes it at `slot_ptr`.
     bool open_slots(const std::vector<int64_t>& slot_bytes, std::string& err);
     void admit(int64_t layer, int64_t expert, int32_t slot) { res_[(size_t) (layer * n_expert_ + expert)] = slot; }
-    bool fill_slot(int32_t slot, const uint8_t* src, uint64_t bytes);
+    uint8_t* slot_ptr(int32_t slot) { return cache_.device_slot(slot); }
     /// Queues, in this order, a copy of a slot's blob into `out` and of `in` into the slot (both pinned, portable host
     /// memory); `read_wait` waits for those queued.
     void exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes);
@@ -89,6 +92,10 @@ public:
     bool open_scratch(int n, uint64_t bytes, std::string& err);
     /// Scratch slots still free for the armed share (all of them again once the next one is armed).
     int scratch_free() const { return (int) scratch_.size() - scratch_used_; }
+    /// Whether a share is armed and not raised yet.
+    bool armed() const { return armed_; }
+    /// Whether the armed share holds `expert` in a scratch slot (fetch).
+    bool fetched(int64_t expert) const;
     /// Copies `bytes` at `src` (pinned host memory) into a free scratch slot for `expert`, over this card's own link on a
     /// stream of its own; the slot, or null when none is free.  The armed share's next `raise` plans the expert's entries
     /// where kind is 3, and `run_fetched` queues them behind the copies.
@@ -144,6 +151,9 @@ public:
     /// out[entry] with a scatter kernel (no D2H copy + host memcpy in finish).
     bool launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind,
                 std::string& err, float* out = nullptr);
+    /// `launch` for a model that states its own layout: the entries i with kind[i] == 2 of `layer`, whose blobs the layout describes.
+    bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
+                       int64_t k, const int32_t* kind, std::string& err, float* out);
     /// Waits for the launched share and writes its rows into `out` (row i = entry i, n_embd floats).
     bool finish(float* out, std::string& err);
 
@@ -205,6 +215,7 @@ private:
     std::vector<Evict> evicting_;                     ///< exclusive swaps whose victim is still being copied to RAM
     cudaEvent_t evict_ev_ = nullptr;
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
+    std::pair<int32_t, int32_t> first_{0, 0};   ///< the fill's first pair, which verify_fill checks
     cudaStream_t stream_ = nullptr, refill_ = nullptr;
     cudaEvent_t refill_ev_ = nullptr;
     std::vector<cudaEvent_t> marks_;                  ///< open_plain: mark_in's marks, reused in turn
@@ -248,8 +259,6 @@ private:
     /// The plan of a share in h_meta_ (and row_of_): its groups and entries, or false when an entry is not resident.
     bool plan(int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind, int& groups, int& rows,
               std::string& err);
-    bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
-                       int64_t k, const int32_t* kind, std::string& err, float* out);
 };
 
 }  // namespace basalt::core

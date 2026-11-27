@@ -21,8 +21,10 @@ Flow Request::decode_loop(B& b) {
     produced_n = 0;
     draft_offered = 0;
     draft_accepted = 0;
-    window = std::vector<int32_t>((size_t) b.max_window());
-    outv = std::vector<int32_t>((size_t) b.max_window());
+    windows = 0;
+    const size_t win_cap = (size_t) std::max<int64_t>(b.max_window(), n - fold_p0);
+    window = std::vector<int32_t>(win_cap);
+    outv = std::vector<int32_t>(win_cap);
     consumed.reserve((size_t) (n + max_new + b.max_window()));
     for (int64_t i = 0; i < fold_p0; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
     finish = "length";
@@ -68,6 +70,7 @@ Flow Request::decode_loop(B& b) {
             b.upload_history(T);
         }
         b.mark_before_run();
+        runtime_.stats_lookups_begin();
         typename B::TierStep tier(b);
         tier.before_window(T, e0, from_sfx);
         const Clock::time_point tw0 = Clock::now();
@@ -77,7 +80,7 @@ Flow Request::decode_loop(B& b) {
         if constexpr (kSpec) held_run = b.take_held(T);
         if (!ran || b.window_failed()) {
             std::printf("ERR %s\n", b.window_error());
-            return Flow::error;
+            return b.window_refused() ? Flow::next : Flow::error;   // refused: the session holds what it held, the engine serves on
         }
         int a = 0;
         if (e0 > 0) {
@@ -88,19 +91,26 @@ Flow Request::decode_loop(B& b) {
             a = b.accept_drafts(T);
         }
         if (gguard != nullptr && gguard->on()) {
-            // the first sampled token the grammar refuses is drawn again under the grammar's mask, and the window ends there
-            const int miss = gguard->scan(outv.data(), a + 1);
+            // the first generated token the grammar refuses is drawn again under the grammar's mask, and the window
+            // ends there; with no token allowed at all the reply ends after this window, as an error
+            const int miss = gguard->scan(outv.data(), a + 1, e0);
             if (miss >= 0) {
-                gguard->mask_bias(req_bias, grammar_bias);
                 int32_t gtok = 0;
-                if (!b.resample_row(miss, p, grammar_bias, gtok, runtime_.err)) {
-                    std::printf("ERR %s\n", runtime_.err.c_str());
+                const basalt::program::grammar::Redraw verdict = gguard->redraw(
+                    req_bias,
+                    [&](const std::vector<float>& bias, int32_t& t) { return b.resample_row(miss, p, bias, t, runtime_.err); },
+                    [&](std::vector<float>& lg) {
+                        lg.resize((size_t) runtime_.n_vocab);
+                        return b.copy_logits(miss, lg.data());
+                    },
+                    gtok);
+                if (verdict == basalt::program::grammar::Redraw::failed) {
+                    std::printf("ERR %s\n", runtime_.err.empty() ? "the masked draw failed" : runtime_.err.c_str());
                     return Flow::error;
                 }
-                outv[(size_t) miss] = gtok;
+                if (verdict == basalt::program::grammar::Redraw::dead) grammar_dead = true;
+                else outv[(size_t) miss] = gtok;
                 a = miss;
-                if (!gguard->take(gtok))
-                    basalt::log::info("basalt grammar", "the masked draw at row %d of %d was token %d", miss, T, (int) gtok);
                 ++grammar_resamples;
             }
         }
@@ -149,6 +159,7 @@ Flow Request::decode_loop(B& b) {
         for (int i = 0; i < keep; ++i) consumed.push_back(window[(size_t) i]);
         draft_offered += T - 1 - e0;
         draft_accepted += a - e0;
+        ++windows;
         first_window = false;
         bool commit_ok = true, after_ran = false, eos = false;
         std::string cerr;
@@ -168,6 +179,7 @@ Flow Request::decode_loop(B& b) {
             std::fflush(stdout);
         };
         b.count_round();
+        const int64_t sent0 = produced_n;
         const Clock::time_point tw2 = Clock::now();
         bool drafted = true;
         if constexpr (kSpec) {
@@ -177,6 +189,9 @@ Flow Request::decode_loop(B& b) {
         if (!after_ran) after_launch();
         b.window_timing(T, a, from_sfx, round0, tw0, tw1, tw2);
         tier.finish();
+        runtime_.stats_window(slot_b, T - 1 - e0, a - e0, (int) (produced_n - sent0));
+        runtime_.stats_lookups_end();
+        runtime_.stats_tick();
         b.mark_after_window();
         if (!commit_ok) {
             std::printf("ERR %s\n", cerr.c_str());
@@ -195,6 +210,7 @@ Flow Request::decode_loop(B& b) {
         }
         b.mark_loop_end();
         if (eos) { finish = "stop"; break; }
+        if (grammar_dead) { finish = "error"; break; }
         b.shed_low();
         if (runtime_.halted()) { finish = "cancel"; break; }
         x = outv[(size_t) keep - 1];

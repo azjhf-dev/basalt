@@ -1,9 +1,10 @@
 // src/kernels/cpu/nvfp4_avx2_rows.inc - NVFP4 expert rows against Q8_0 activations, several tokens at once, in 256-bit
 // lanes.
 //
-// Included by nvfp4_avx2.cpp (BASALT_NVFP4_VNNI_INT8 0: `vpsignb` + `vpmaddubsw` + `vpmaddwd`) and nvfp4_avx2_vnni.cpp
-// (BASALT_NVFP4_VNNI_INT8 1: AVX-VNNI-INT8 `vpdpbssd` directly on the signed bytes), which name the exported functions
-// through BASALT_NVFP4_EXPORT.
+// Included by nvfp4_avx2.cpp (BASALT_NVFP4_VNNI_INT8 0, BASALT_NVFP4_VNNI 0: `vpsignb` + `vpmaddubsw` + `vpmaddwd`),
+// nvfp4_avx2_dpbusd.cpp (BASALT_NVFP4_VNNI 1: the same products and four-wise sums by AVX-VNNI `vpdpbusd`) and
+// nvfp4_avx2_vnni.cpp (BASALT_NVFP4_VNNI_INT8 1: AVX-VNNI-INT8 `vpdpbssd` directly on the signed bytes), which name
+// the exported functions through BASALT_NVFP4_EXPORT.
 //
 // The ggml dot (ggml_vec_dot_nvfp4_q8_0, AVX2 branch) is single-token: every token re-decodes the codes, the sign
 // pattern and the four UE4M3 scales of each block.  Here a block is decoded once and every token applies it.  Per token
@@ -102,7 +103,7 @@ inline void prep_tokens(const block_q8_0* const* y, int nb, TokBlk* tb) {
 // R rows (each its own block pointer) against NT tokens: res[k][t].
 template <int R, int NT>
 inline void rows_dot(const block_nvfp4* const* w, int nb, const TokBlk* tb, float (*res)[kMaxT]) {
-#if !BASALT_NVFP4_VNNI_INT8
+#if !BASALT_NVFP4_VNNI_INT8 && !BASALT_NVFP4_VNNI
     const __m256i ones = _mm256_set1_epi16(1);
 #endif
     __m256 acc1[R][NT], acc2[R][NT];
@@ -120,6 +121,12 @@ inline void rows_dot(const block_nvfp4* const* w, int nb, const TokBlk* tb, floa
 #if BASALT_NVFP4_VNNI_INT8
                 const __m256i pa = _mm256_dpbssd_epi32(_mm256_setzero_si256(), b[k].wa, ya);
                 const __m256i pb = _mm256_dpbssd_epi32(_mm256_setzero_si256(), b[k].wb, yb);
+#elif BASALT_NVFP4_VNNI
+                // one `vpdpbusd` for the products and the four-wise sums: bitwise `vpmaddubsw` + `vpmaddwd` with ones,
+                // whose int16 pair sums cannot saturate for these operands (|w| <= 12, |y| <= 127) - as in the
+                // AVX-512 kernel's `_mm512_dpbusd_epi32` and iq_avx2_rows.inc's iq_dot4.
+                const __m256i pa = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), b[k].aa, _mm256_sign_epi8(ya, b[k].wa));
+                const __m256i pb = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), b[k].ab, _mm256_sign_epi8(yb, b[k].wb));
 #else
                 const __m256i pa = _mm256_madd_epi16(_mm256_maddubs_epi16(b[k].aa, _mm256_sign_epi8(ya, b[k].wa)), ones);
                 const __m256i pb = _mm256_madd_epi16(_mm256_maddubs_epi16(b[k].ab, _mm256_sign_epi8(yb, b[k].wb)), ones);
@@ -134,7 +141,7 @@ inline void rows_dot(const block_nvfp4* const* w, int nb, const TokBlk* tb, floa
 }
 
 template <int NT>
-void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su, float limit,
+void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su, const SwiGlu& glu,
              const void* const* act, float* const* ff, int r0, int r1) {
     const block_q8_0* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_0*) act[t];
@@ -152,12 +159,7 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg,
             rows_dot<1, NT>(&w[1], nb, tb, &res[1]);
         }
         for (int t = 0; t < NT; ++t) {
-            float g = res[0][t] * sg, u = res[1][t] * su;
-            if (limit > 0.f) {
-                g = std::fmin(g, limit);
-                u = std::fmax(std::fmin(u, limit), -limit);
-            }
-            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            ff[t][r] = swiglu(glu, res[0][t] * sg, res[1][t] * su);
         }
     }
 }
@@ -193,21 +195,21 @@ void down_rows(const uint8_t* w0, size_t row_bytes, int n, float sd, const void*
 }  // namespace
 
 void BASALT_NVFP4_EXPORT(nvfp4_256_gu_rows)(const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg,
-                                            float su, float limit, const void* const* act, int nt, float* const* ff, int r0,
-                                            int r1) {
+                                            float su, const SwiGlu& glu, const void* const* act, int nt, float* const* ff,
+                                            int r0, int r1) {
     for (int t0 = 0; t0 < nt; t0 += kMaxT) {
         const int k = nt - t0 < kMaxT ? nt - t0 : kMaxT;
         const void* const* a = act + t0;
         float* const* o = ff + t0;
         switch (k) {
-            case 1: gu_rows<1>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 2: gu_rows<2>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 3: gu_rows<3>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 4: gu_rows<4>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 5: gu_rows<5>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 6: gu_rows<6>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 7: gu_rows<7>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
-            case 8: gu_rows<8>(blob, gu_row, up_off, n, sg, su, limit, a, o, r0, r1); break;
+            case 1: gu_rows<1>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 2: gu_rows<2>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 3: gu_rows<3>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 4: gu_rows<4>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 5: gu_rows<5>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 6: gu_rows<6>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 7: gu_rows<7>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
+            case 8: gu_rows<8>(blob, gu_row, up_off, n, sg, su, glu, a, o, r0, r1); break;
         }
     }
 }

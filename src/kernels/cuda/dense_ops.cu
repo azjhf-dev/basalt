@@ -1,7 +1,9 @@
 // src/kernels/cuda/dense_ops.cu - see include/basalt/kernels/dense_ops.hpp.
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
+#include "basalt/kernels/kv_fp4.cuh"
 #include "basalt/kernels/pdl.hpp"
+#include "philox.cuh"
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -152,6 +154,210 @@ __global__ void __launch_bounds__(32) bf16_rows_dot_kernel(const float* __restri
         }
 }
 
+// bf16_rows_dot for few outputs over a long K (a loop controller's down product: 64 outputs, K 4608), where the kernel above
+// gives too few warps: a block of RT_W warps takes 16 rows, each warp one 8-output tile; the rows' x and the warps' weight
+// rows go through shared memory in double-buffered RT_KC-value stages (cp.async), so each step reads shared memory only.
+// Each output runs the kernel above's chain (the same tf32 terms and mma steps in k order), so the results are the same bits.
+constexpr int RT_W = 4, RT_KC = 128, RT_XS = RT_KC + 8, RT_WS = RT_KC + 8;
+__device__ __forceinline__ void rt_cp16(void* dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src));
+}
+__global__ void __launch_bounds__(32 * RT_W) bf16_rows_dot_tiles_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+                                                                        float* __restrict__ y, int64_t T, int64_t N, int64_t K) {
+    __shared__ __align__(16) float xs[2][RD_T][RT_XS];
+    __shared__ __align__(16) uint16_t ws[2][RT_W * 8][RT_WS];
+    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, c = lane & 3;
+    const int64_t t0 = (int64_t) blockIdx.x * RD_T, nb = (int64_t) blockIdx.y * RT_W * 8, n0 = nb + wid * 8;
+    const bool live = n0 < N;
+    const int nkc = (int) (K / RT_KC);
+    // one stage: x rows [16][RT_KC] (512 16-byte pieces) and weight rows [RT_W * 8][RT_KC] (RT_W * 128 pieces)
+    const auto load = [&](int buf, int kc) {
+        const int64_t k0 = (int64_t) kc * RT_KC;
+        for (int q = threadIdx.x; q < RD_T * RT_KC / 4; q += 32 * RT_W) {
+            const int r = q / (RT_KC / 4), k4 = (q % (RT_KC / 4)) * 4;
+            rt_cp16(&xs[buf][r][k4], x + min(t0 + r, T - 1) * K + k0 + k4);
+        }
+        for (int q = threadIdx.x; q < RT_W * 8 * RT_KC / 8; q += 32 * RT_W) {
+            const int r = q / (RT_KC / 8), k8 = (q % (RT_KC / 8)) * 8;
+            rt_cp16(&ws[buf][r][k8], w + min(nb + r, N - 1) * K + k0 + k8);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    float acc[4] = {};
+    load(0, 0);
+    for (int kc = 0; kc < nkc; ++kc) {
+        if (kc + 1 < nkc) {
+            load((kc + 1) & 1, kc + 1);
+            asm volatile("cp.async.wait_group 1;\n" ::);
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::);
+        }
+        __syncthreads();
+        const int buf = kc & 1;
+        if (live) {
+            const float* xa = &xs[buf][g][2 * c];
+            const float* xb = &xs[buf][g + 8][2 * c];
+            const uint16_t* wr = &ws[buf][wid * 8 + g][2 * c];
+#pragma unroll 8
+            for (int k = 0; k < RT_KC; k += 8) {
+                const float2 fa = *reinterpret_cast<const float2*>(xa + k), fb = *reinterpret_cast<const float2*>(xb + k);
+                const unsigned wv = *reinterpret_cast<const unsigned*>(wr + k);
+                const unsigned a0 = tf32_of(fa.x), a1 = tf32_of(fb.x), a2 = tf32_of(fa.y), a3 = tf32_of(fb.y);
+                const unsigned l0 = tf32_of(fa.x - __uint_as_float(a0)), l1 = tf32_of(fb.x - __uint_as_float(a1));
+                const unsigned l2 = tf32_of(fa.y - __uint_as_float(a2)), l3 = tf32_of(fb.y - __uint_as_float(a3));
+                asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                             : "r"(l0), "r"(l1), "r"(l2), "r"(l3), "r"(wv << 16), "r"(wv & 0xFFFF0000u));
+                asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(wv << 16), "r"(wv & 0xFFFF0000u));
+            }
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int64_t t = t0 + g + (i >> 1) * 8, n = n0 + 2 * c + (i & 1);
+        if (t < T && n < N) y[t * N + n] = acc[i];
+    }
+}
+
+// y[t][n] = sum_k x[t][k] w[n][k] in fp32: a block of 128 threads per 32 rows x 64 outputs, K in steps of 16 through shared
+// memory (both tiles k-major), each thread 4 rows x 4 outputs. Every output sums its products in k order, so a row's result
+// does not depend on the rows beside it.
+// Bitwise-identical 3-stage cp.async f32_rows_dot: loads row-major K=32 stages directly via 16B cp.async.cg (1 barrier/stage),
+// reads strided rows (stride 36 floats == 4 banks mod 32 -> conflict-free LDS.128), and accumulates fmaf in exact k=0..K-1 order.
+template <int BT, int BN, int BK, int ST, int THR_T, int THR_N, int MIN_BLK>
+__global__ void __launch_bounds__(THR_T * THR_N, MIN_BLK)
+f32_rows_dot_cpasync_kernel(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ y,
+                            int64_t T, int64_t N, int64_t K) {
+    constexpr int LD = BK + 4;
+    constexpr int RT = BT / THR_T, RN = BN / THR_N;
+    constexpr int NTHR = THR_T * THR_N;
+    __shared__ __align__(16) float xs[ST][BT][LD];
+    __shared__ __align__(16) float ws[ST][BN][LD];
+
+    const int tid = threadIdx.x;
+    const int tr = tid / THR_N, tc = tid % THR_N;
+    const int64_t t0 = (int64_t) blockIdx.x * BT, n0 = (int64_t) blockIdx.y * BN;
+    const int n_stages = (int) (K / BK);
+
+    const auto issue_stage = [&](int s, int stg) {
+        const int64_t k0 = (int64_t) stg * BK;
+#pragma unroll
+        for (int q = tid; q < BT * (BK / 4); q += NTHR) {
+            const int r = q / (BK / 4), k4 = (q % (BK / 4)) * 4;
+            rt_cp16(&xs[s][r][k4], x + min(t0 + r, T - 1) * K + k0 + k4);
+        }
+#pragma unroll
+        for (int q = tid; q < BN * (BK / 4); q += NTHR) {
+            const int r = q / (BK / 4), k4 = (q % (BK / 4)) * 4;
+            rt_cp16(&ws[s][r][k4], w + min(n0 + r, N - 1) * K + k0 + k4);
+        }
+    };
+
+    const int preload = min(ST - 1, n_stages);
+    for (int stg = 0; stg < preload; ++stg) {
+        issue_stage(stg, stg);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+
+    float acc[RT][RN] = {};
+    for (int stg = 0; stg < n_stages; ++stg) {
+        const int cur = stg % ST;
+        const int rem_after = min(ST - 2, (n_stages - 1) - stg);
+        if (rem_after == 2) asm volatile("cp.async.wait_group 2;" ::: "memory");
+        else if (rem_after == 1) asm volatile("cp.async.wait_group 1;" ::: "memory");
+        else asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+
+        if (stg + (ST - 1) < n_stages) {
+            const int nxt = (stg + ST - 1) % ST;
+            issue_stage(nxt, stg + ST - 1);
+            asm volatile("cp.async.commit_group;" ::: "memory");
+        }
+
+#pragma unroll
+        for (int k4 = 0; k4 < BK; k4 += 4) {
+            float4 av[RT], bv[RN];
+#pragma unroll
+            for (int i = 0; i < RT; ++i) av[i] = *reinterpret_cast<const float4*>(&xs[cur][tr + i * THR_T][k4]);
+#pragma unroll
+            for (int j = 0; j < RN; ++j) bv[j] = *reinterpret_cast<const float4*>(&ws[cur][tc + j * THR_N][k4]);
+#pragma unroll
+            for (int i = 0; i < RT; ++i)
+#pragma unroll
+                for (int j = 0; j < RN; ++j) {
+                    acc[i][j] = fmaf(av[i].x, bv[j].x, acc[i][j]);
+                    acc[i][j] = fmaf(av[i].y, bv[j].y, acc[i][j]);
+                    acc[i][j] = fmaf(av[i].z, bv[j].z, acc[i][j]);
+                    acc[i][j] = fmaf(av[i].w, bv[j].w, acc[i][j]);
+                }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < RT; ++i) {
+        const int64_t t = t0 + tr + i * THR_T;
+        if (t < T) {
+#pragma unroll
+            for (int j = 0; j < RN; ++j) {
+                const int64_t n = n0 + tc + j * THR_N;
+                if (n < N) y[t * N + n] = acc[i][j];
+            }
+        }
+    }
+}
+
+constexpr int FD_T = 32, FD_N = 64, FD_K = 16;
+__global__ void __launch_bounds__(128) f32_rows_dot_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                                           float* __restrict__ y, int64_t T, int64_t N, int64_t K) {
+    __shared__ __align__(16) float xs[FD_K][FD_T + 4];
+    __shared__ __align__(16) float ws[FD_K][FD_N + 4];
+    const int tid = threadIdx.x, tr = tid / (FD_N / 4), tc = tid % (FD_N / 4);
+    const int64_t t0 = (int64_t) blockIdx.x * FD_T, n0 = (int64_t) blockIdx.y * FD_N;
+    float acc[4][4] = {};
+    for (int64_t k0 = 0; k0 < K; k0 += FD_K) {
+        {
+            const int r = tid / 4, kq = (tid % 4) * 4;
+            const float4 v = *reinterpret_cast<const float4*>(x + min(t0 + r, T - 1) * K + k0 + kq);
+            xs[kq][r] = v.x;
+            xs[kq + 1][r] = v.y;
+            xs[kq + 2][r] = v.z;
+            xs[kq + 3][r] = v.w;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int n = r + h * FD_T;
+                const float4 u = *reinterpret_cast<const float4*>(w + min(n0 + n, N - 1) * K + k0 + kq);
+                ws[kq][n] = u.x;
+                ws[kq + 1][n] = u.y;
+                ws[kq + 2][n] = u.z;
+                ws[kq + 3][n] = u.w;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < FD_K; ++k) {
+            const float4 a = *reinterpret_cast<const float4*>(&xs[k][tr * 4]);
+            const float4 b = *reinterpret_cast<const float4*>(&ws[k][tc * 4]);
+            const float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int64_t t = t0 + tr * 4 + i, n = n0 + tc * 4 + j;
+            if (t < T && n < N) y[t * N + n] = acc[i][j];
+        }
+}
+
 // The GDN a/b projections of a prompt chunk with the gates fused: a and b are the first and last HV (= 48) rows of w
 // [2 HV][K] (BF16), gate[t][h] = softplus(a + dt[h]) * ssm_a[h], beta[t][h] = sigmoid(b) - the expressions of gdn_gates.
 // The product runs on BF16 tensor cores (m16n8k16): x is split into two BF16 terms (hi + lo, about 17 bits of x; the BF16
@@ -283,7 +489,7 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
                                                             const float* __restrict__ k_norm, float eps, RopeSpec rope,
                                                             const int32_t* pos, int n_head, int n_kv, QO* q_out,
                                                             __half* k_cache, __half* v_cache, int64_t cell0, int q_stride,
-                                                            int64_t cap, const int32_t* cell0_dev, KvInt8 q8) {
+                                                            int64_t cap, const int32_t* cell0_dev, KvInt8 q8, KvFar far_kv) {
     pdl_launch_dependents();
     pdl_wait();
     __shared__ float red[HDW / 32];
@@ -304,19 +510,48 @@ __global__ void __launch_bounds__(HDW) attn_qk_prepare_kernel(const In* q_full, 
         const float ang = (float) pos[t * 3 + rope.axis[i]] * inv_freq;
         float sn, cs;
         sincosf(ang, &sn, &cs);
+        if (rope.mscale != 1.0f) {
+            sn *= rope.mscale;
+            cs *= rope.mscale;
+        }
         y = d < half ? y * cs - xs[d + half] * sn : y * cs + xs[d - half] * sn;
+    }
+    // an NVFP4 cache holds the keys turned by the Hadamard transform, so the queries read against it are turned too (the
+    // transform is orthonormal: every dot product is the same); the whole block takes this branch or none of it
+    if constexpr (HDW == 256) {
+        if (q8.fp4) y = kv4_hadamard256(y, xs, d);
     }
     if (is_q) {
         stf(q_out + (t * n_head + head) * HDW + d, y);
         return;
     }
     const int64_t c0 = cell0_dev ? (int64_t) *cell0_dev : cell0;
-    const int64_t cell = cap > 0 ? (c0 + t) % cap : c0 + t;
+    int64_t cell = cap > 0 ? (c0 + t) % cap : c0 + t;
+    const bool fa = cell >= far_kv.at;   // a split cache's far cell: its row in the far buffers
+    if (fa) cell -= far_kv.at;
     const int64_t at = (cell * n_kv + head) * HDW + d;
     const float vv = ldf(v + (t * n_kv + head) * HDW + d);
     if (!q8.k) {
-        k_cache[at] = __float2half_rn(y);
-        v_cache[at] = __float2half_rn(vv);
+        (fa ? (__half*) far_kv.k : k_cache)[at] = __float2half_rn(y);
+        (fa ? (__half*) far_kv.v : v_cache)[at] = __float2half_rn(vv);
+        return;
+    }
+    if (fa) q8 = far_kv.q8;
+    if (q8.fp4) {
+        // NVFP4: per 16 values (16 lanes of a warp) the E4M3 scale amax / 6, each value the nearest E2M1 code against the
+        // decoded scale; a lane pair packs its two codes into one byte, the even dim in the low nibble
+        const int64_t row = cell * n_kv + head;
+        const uint32_t sk = kv4_group_scale(kv4_amax16(y)), sv = kv4_group_scale(kv4_amax16(vv));
+        const uint32_t ck = kv4_group_code(y, kv4_e4m3_value(sk)), cv = kv4_group_code(vv, kv4_e4m3_value(sv));
+        const uint32_t nk = __shfl_down_sync(0xffffffffu, ck, 1), nv = __shfl_down_sync(0xffffffffu, cv, 1);
+        if ((d & 1) == 0) {
+            reinterpret_cast<uint8_t*>(q8.k)[row * (HDW / 2) + d / 2] = (uint8_t) (ck | (nk << 4));
+            reinterpret_cast<uint8_t*>(q8.v)[row * (HDW / 2) + d / 2] = (uint8_t) (cv | (nv << 4));
+        }
+        if ((d & 15) == 0) {
+            reinterpret_cast<uint8_t*>(q8.ks)[row * (HDW / 16) + d / 16] = (uint8_t) sk;
+            reinterpret_cast<uint8_t*>(q8.vs)[row * (HDW / 16) + d / 16] = (uint8_t) sv;
+        }
         return;
     }
     // int8: per 64 values, scale = amax / 127 (stored fp16), codes rounded to nearest against the stored scale; a group
@@ -362,10 +597,12 @@ __global__ void dyn_conv2_kernel(const float* x, const float* dyn, int64_t ld_dy
 
 // One block of `rank` threads walks the positions: the predecessor's row times h into shared memory, then each warp
 // scores its candidates (a warp sum over the rank), then one thread picks.  Two barriers a position.
+// The pick: the best score (temperature <= 0), or a draw from softmax(score / temperature) on Philox's draft stream at
+// (seed, pos0 + position).  q gets that softmax (one-hot at the best for an argmax pick), conf the best entry's share.
 __global__ void candidate_path_kernel(const float* __restrict__ lp_rows, int stride, int top, const float* __restrict__ h,
                                       const uint16_t* __restrict__ pred, const uint16_t* __restrict__ succ, int rank,
                                       const int32_t* __restrict__ anchor, int n, int32_t* __restrict__ ids,
-                                      float* __restrict__ conf) {
+                                      float* __restrict__ conf, CandidateDraw draw) {
     extern __shared__ float ph[];   // [rank]
     __shared__ float score[64];
     __shared__ int32_t prev_s;
@@ -374,7 +611,7 @@ __global__ void candidate_path_kernel(const float* __restrict__ lp_rows, int str
     __syncthreads();
     for (int p = 0; p < n; ++p) {
         const float* row = lp_rows + (size_t) p * stride;
-        ph[r] = __uint_as_float((uint32_t) pred[(size_t) prev_s * rank + r] << 16) * h[(size_t) p * rank + r];
+        ph[r] = prev_s >= 0 ? __uint_as_float((uint32_t) pred[(size_t) prev_s * rank + r] << 16) * h[(size_t) p * rank + r] : 0.0f;
         __syncthreads();
         for (int k = warp; k < top; k += warps) {
             const int32_t cand = __float_as_int(row[2 + 2 * k]);
@@ -383,19 +620,64 @@ __global__ void candidate_path_kernel(const float* __restrict__ lp_rows, int str
                 for (int i = lane; i < rank; i += 32) v += ph[i] * __uint_as_float((uint32_t) succ[(size_t) cand * rank + i] << 16);
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-            if (lane == 0) score[k] = cand >= 0 ? row[3 + 2 * k] + v : -1e30f;
+            if (lane == 0) score[k] = cand >= 0 ? row[3 + 2 * k] + v : -INFINITY;
         }
         __syncthreads();
         if (r == 0) {
-            int best = 0;
-            for (int k = 1; k < top; ++k)
-                if (score[k] > score[best]) best = k;
-            float z = 0.0f;
-            for (int k = 0; k < top; ++k) z += expf(score[k] - score[best]);
-            const int32_t id = __float_as_int(row[2 + 2 * best]);
-            ids[p] = id;
-            conf[p] = 1.0f / z;
-            prev_s = id;
+            int best = -1;
+            int first_valid = -1;
+            float best_s = -INFINITY;
+            for (int k = 0; k < top; ++k) {
+                const int32_t ck = __float_as_int(row[2 + 2 * k]);
+                if (ck < 0) continue;
+                if (first_valid < 0) first_valid = k;
+                if (!isnan(score[k]) && (best < 0 || score[k] > best_s)) { best = k; best_s = score[k]; }
+            }
+            if (draw.q_ids)
+                for (int k = 0; k < top; ++k) draw.q_ids[(size_t) p * top + k] = __float_as_int(row[2 + 2 * k]);
+            if (first_valid < 0) {
+                if (draw.q_p)
+                    for (int k = 0; k < top; ++k) draw.q_p[(size_t) p * top + k] = 0.0f;
+                ids[p] = 0;
+                conf[p] = 0.0f;
+                prev_s = -1;
+            } else {
+                if (best < 0) best = first_valid;
+                const bool finite_best = isfinite(best_s);
+                float z = 0.0f;
+                if (finite_best) {
+                    for (int k = 0; k < top; ++k)
+                        if (score[k] > -INFINITY) z += expf(score[k] - best_s);
+                } else {
+                    z = 1.0f;
+                }
+                int pick = best;
+                if (draw.temperature > 0.0f && finite_best) {
+                    const float inv_t = 1.0f / draw.temperature;
+                    float zt = 0.0f;
+                    for (int k = 0; k < top; ++k) {
+                        if (score[k] > -INFINITY)
+                            zt += (score[k] == best_s) ? 1.0f : expf((score[k] - best_s) * inv_t);
+                    }
+                    const float u = philox_uniform(draw.seed, (uint64_t) (draw.pos0 + p), kPhiloxDraft) * zt;
+                    float cum = 0.0f;
+                    bool found = false;
+                    for (int k = 0; k < top; ++k) {
+                        const float e = score[k] > -INFINITY
+                                            ? ((score[k] == best_s) ? 1.0f : expf((score[k] - best_s) * inv_t))
+                                            : 0.0f;
+                        if (draw.q_p) draw.q_p[(size_t) p * top + k] = e / zt;
+                        cum += e;
+                        if (!found && e > 0.0f && u < cum) { pick = k; found = true; }
+                    }
+                } else if (draw.q_p) {
+                    for (int k = 0; k < top; ++k) draw.q_p[(size_t) p * top + k] = k == best ? 1.0f : 0.0f;
+                }
+                const int32_t id = __float_as_int(row[2 + 2 * pick]);
+                ids[p] = id;
+                conf[p] = z > 0.0f ? 1.0f / z : 0.0f;
+                prev_s = id;
+            }
         }
         __syncthreads();
     }
@@ -410,11 +692,14 @@ __global__ void attn_gate_kernel(const float* __restrict__ attn, const float* __
     out[i] = attn[i] / (1.0f + expf(-g));
 }
 
-// attn_gate_kernel's values of one token's row (block per token), rounded to E4M3 with scale amax / 448 as
-// prefill::fp8::quantize rounds them (bitwise)
-template <class Q, class A = float>
-__global__ void __launch_bounds__(256) attn_gate_e4m3_kernel(const A* __restrict__ attn, const Q* __restrict__ q_full,
-                                                             int n_head, uint8_t* __restrict__ codes, float* __restrict__ scales) {
+// attn_gate_kernel's values of one token's row (block per token) for the out projection.  E4M3: rounded with scale
+// amax / 448 as prefill::fp8::quantize rounds them (bitwise).  Else rounded to BF16 (out16) with the token's largest
+// |value| as stored (rowmax, for prefill::fp4_dense::quantize_amax).
+template <class Q, class A = float, bool E4M3 = true>
+__global__ void __launch_bounds__(256) attn_gate_token_kernel(const A* __restrict__ attn, const Q* __restrict__ q_full,
+                                                              int n_head, uint8_t* __restrict__ codes, float* __restrict__ scales,
+                                                              __nv_bfloat16* __restrict__ out16 = nullptr,
+                                                              float* __restrict__ rowmax = nullptr) {
     constexpr int kPer = 8;   // values a thread keeps: n_head * HD <= 256 * 4 * kPer
     __shared__ float red[8];
     const int64_t t = blockIdx.x;
@@ -444,8 +729,19 @@ __global__ void __launch_bounds__(256) attn_gate_e4m3_kernel(const A* __restrict
             const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
             g = make_float4(a.x, a.y, b.x, b.y);
         }
-        v[j] = make_float4(a.x / (1.0f + expf(-g.x)), a.y / (1.0f + expf(-g.y)), a.z / (1.0f + expf(-g.z)), a.w / (1.0f + expf(-g.w)));
-        m = fmaxf(m, fmaxf(fmaxf(fabsf(v[j].x), fabsf(v[j].y)), fmaxf(fabsf(v[j].z), fabsf(v[j].w))));
+        const float4 val = make_float4(a.x / (1.0f + expf(-g.x)), a.y / (1.0f + expf(-g.y)),
+                                       a.z / (1.0f + expf(-g.z)), a.w / (1.0f + expf(-g.w)));
+        if constexpr (E4M3) {
+            v[j] = val;
+            m = fmaxf(m, fmaxf(fmaxf(fabsf(val.x), fabsf(val.y)), fmaxf(fabsf(val.z), fabsf(val.w))));
+        } else {
+            const __nv_bfloat162 lo = __floats2bfloat162_rn(val.x, val.y);
+            const __nv_bfloat162 hi = __floats2bfloat162_rn(val.z, val.w);
+            *reinterpret_cast<uint2*>(out16 + t * cols + i) =
+                make_uint2(*reinterpret_cast<const unsigned*>(&lo), *reinterpret_cast<const unsigned*>(&hi));
+            m = fmaxf(m, fmaxf(fmaxf(fabsf(__low2float(lo)), fabsf(__high2float(lo))),
+                               fmaxf(fabsf(__low2float(hi)), fabsf(__high2float(hi)))));
+        }
     }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
@@ -454,15 +750,19 @@ __global__ void __launch_bounds__(256) attn_gate_e4m3_kernel(const A* __restrict
     float amax = 0.0f;
 #pragma unroll
     for (int i = 0; i < 8; ++i) amax = fmaxf(amax, red[i]);
-    if (threadIdx.x == 0) scales[t] = amax / 448.0f;
-    const float q = amax > 0.0f ? 448.0f / amax : 0.0f;
+    if constexpr (E4M3) {
+        if (threadIdx.x == 0) scales[t] = amax / 448.0f;
+        const float q = amax > 0.0f ? 448.0f / amax : 0.0f;
 #pragma unroll
-    for (int j = 0; j < kPer; ++j) {
-        const int i = (j * 256 + (int) threadIdx.x) * 4;
-        if (i >= cols) break;
-        const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(v[j].x * q, v[j].y * q), __NV_SATFINITE, __NV_E4M3);
-        const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(v[j].z * q, v[j].w * q), __NV_SATFINITE, __NV_E4M3);
-        *reinterpret_cast<uint32_t*>(codes + t * cols + i) = (uint32_t) lo | ((uint32_t) hi << 16);
+        for (int j = 0; j < kPer; ++j) {
+            const int i = (j * 256 + (int) threadIdx.x) * 4;
+            if (i >= cols) break;
+            const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(v[j].x * q, v[j].y * q), __NV_SATFINITE, __NV_E4M3);
+            const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(v[j].z * q, v[j].w * q), __NV_SATFINITE, __NV_E4M3);
+            *reinterpret_cast<uint32_t*>(codes + t * cols + i) = (uint32_t) lo | ((uint32_t) hi << 16);
+        }
+    } else {
+        if (threadIdx.x == 0 && rowmax) rowmax[t] = amax;
     }
 }
 
@@ -520,12 +820,39 @@ void swiglu_scaled(const float* g, const float* u, const float* sg, const float*
     check("swiglu_scaled");
 }
 
-void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64_t N, int64_t K, void* stream) {
+void bf16_rows_dot(const float* x, const uint16_t* w, float* y, int64_t T, int64_t N, int64_t K, void* stream, bool tiles) {
     if (T <= 0) return;
     if (K % 8 != 0) { basalt::log::error("basalt", "bf16_rows_dot: K %lld", (long long) K); std::exit(1); }
+    if (tiles && N <= 64 && K >= 1024 && K % RT_KC == 0) {   // few outputs over a long K: a warp per 8 outputs, x staged once
+        bf16_rows_dot_tiles_kernel<<<dim3((unsigned) ((T + RD_T - 1) / RD_T), (unsigned) ((N + 8 * RT_W - 1) / (8 * RT_W))), 32 * RT_W, 0,
+                                     (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        check("bf16_rows_dot");
+        return;
+    }
     bf16_rows_dot_kernel<<<dim3((unsigned) ((T + RD_T - 1) / RD_T), (unsigned) ((N + RD_N - 1) / RD_N)), 32, 0,
                            (cudaStream_t) stream>>>(x, w, y, T, N, K);
     check("bf16_rows_dot");
+}
+
+void f32_rows_dot(const float* x, const float* w, float* y, int64_t T, int64_t N, int64_t K, void* stream) {
+    if (T <= 0) return;
+    if (K % FD_K != 0) { basalt::log::error("basalt", "f32_rows_dot: K %lld", (long long) K); std::exit(1); }
+    if (K % 32 == 0 && (((uintptr_t) x | (uintptr_t) w) & 15) == 0) {
+        if (T < 1024) {
+            f32_rows_dot_cpasync_kernel<16, 32, 32, 3, 8, 8, 6>
+                <<<dim3((unsigned) ((T + 15) / 16), (unsigned) ((N + 31) / 32)), 64, 0, (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        } else if (T < 3072) {
+            f32_rows_dot_cpasync_kernel<32, 64, 32, 3, 8, 16, 3>
+                <<<dim3((unsigned) ((T + 31) / 32), (unsigned) ((N + 63) / 64)), 128, 0, (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        } else {
+            f32_rows_dot_cpasync_kernel<48, 64, 16, 4, 8, 16, 3>
+                <<<dim3((unsigned) ((T + 47) / 48), (unsigned) ((N + 63) / 64)), 128, 0, (cudaStream_t) stream>>>(x, w, y, T, N, K);
+        }
+    } else {
+        f32_rows_dot_kernel<<<dim3((unsigned) ((T + FD_T - 1) / FD_T), (unsigned) ((N + FD_N - 1) / FD_N)), 128, 0,
+                              (cudaStream_t) stream>>>(x, w, y, T, N, K);
+    }
+    check("f32_rows_dot");
 }
 
 void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
@@ -551,10 +878,35 @@ void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, c
     check("gdn_gating_proj");
 }
 
+namespace {
+// Each pair's inverse frequency and the magnitude correction, once on the host in double.  Unscaled: theta^(-2i/rot).
+// Scaled: ggml's rope_yarn on the frequency instead of the angle (the angle is the position times it): the
+// interpolated frequency freq_scale theta^(-2i/rot), blended toward the trained one by the ramp at pair i times
+// ext_factor; cos and sin times mscale.
+RopeSpec rope_tables(const RopeSpec& rope) {
+    RopeSpec r = rope;
+    const RopeScaling& sc = rope.scaling;
+    if (sc.type == RopeScalingType::None) {
+        for (int i = 0; i < rope.rot / 2; ++i) r.inv_freq[i] = (float) std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+        return r;
+    }
+    const double fs = sc.freq_scale();
+    double cd[2];
+    sc.corr_dims(rope.rot, cd);
+    for (int i = 0; i < rope.rot / 2; ++i) {
+        const double extrap = std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+        const double mix = sc.ext_factor != 0 ? (double) rope_yarn_ramp((float) cd[0], (float) cd[1], i) * sc.ext_factor : 0.0;
+        r.inv_freq[i] = (float) (fs * extrap * (1.0 - mix) + extrap * mix);
+    }
+    r.mscale = (float) sc.mscale();
+    return r;
+}
+}  // namespace
+
 void attn_qk_prepare(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
                      float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv,
                      float* q_out, uint16_t* k_cache, uint16_t* v_cache, int64_t cell0, void* stream, int hd, bool gated,
-                     int64_t cap, const int32_t* cell0_dev, KvInt8 q8) {
+                     int64_t cap, const int32_t* cell0_dev, KvInt8 q8, KvFar far_kv) {
     if (T <= 0) return;
     if (rope.rot <= 0 || rope.rot > hd || rope.rot % 2 || (hd != 128 && hd != 256)) {
         basalt::log::error("basalt", "attn_qk_prepare: a rotary width of %d in %d-wide heads", rope.rot, hd);
@@ -562,35 +914,32 @@ void attn_qk_prepare(const float* q_full, const float* k, const float* v, const 
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head + n_kv));
     const int qs = gated ? 2 * hd : hd;
-    // each pair's inverse frequency, once on the host in double (the kernel used to take a double pow per thread)
-    RopeSpec r = rope;
-    for (int i = 0; i < rope.rot / 2; ++i) r.inv_freq[i] = (float) std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+    const RopeSpec r = rope_tables(rope);
     if (hd == 256)
         launch_pdl(attn_qk_prepare_kernel<256>, grid, dim3(256), 0, (cudaStream_t) stream, q_full, k, v, q_norm, k_norm, eps, r,
-                   pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8);
+                   pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8, far_kv);
     else
         launch_pdl(attn_qk_prepare_kernel<128>, grid, dim3(128), 0, (cudaStream_t) stream, q_full, k, v, q_norm, k_norm, eps, r,
-                   pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8);
+                   pos, n_head, n_kv, q_out, (__half*) k_cache, (__half*) v_cache, cell0, qs, cap, cell0_dev, q8, far_kv);
     check("attn_qk_prepare");
 }
 
 void attn_qk_prepare_bf16(const uint16_t* q_full, const uint16_t* k, const uint16_t* v, const float* q_norm, const float* k_norm,
                           float eps, const RopeSpec& rope, const int32_t* pos, int64_t T, int n_head, int n_kv, uint16_t* q_out,
-                          int64_t cell0, void* stream, KvInt8 q8, uint16_t* k_cache, uint16_t* v_cache) {
+                          int64_t cell0, void* stream, KvInt8 q8, uint16_t* k_cache, uint16_t* v_cache, KvFar far_kv) {
     if (T <= 0) return;
     if (rope.rot <= 0 || rope.rot > 256 || rope.rot % 2) {
         basalt::log::error("basalt", "attn_qk_prepare_bf16: a rotary width of %d", rope.rot);
         std::exit(1);
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head + n_kv));
-    RopeSpec r = rope;
-    for (int i = 0; i < rope.rot / 2; ++i) r.inv_freq[i] = (float) std::pow((double) rope.theta, -2.0 * (double) i / (double) rope.rot);
+    const RopeSpec r = rope_tables(rope);
     const __nv_bfloat16* qf = reinterpret_cast<const __nv_bfloat16*>(q_full);
     const __nv_bfloat16* kk = reinterpret_cast<const __nv_bfloat16*>(k);
     const __nv_bfloat16* vv = reinterpret_cast<const __nv_bfloat16*>(v);
     launch_pdl(attn_qk_prepare_kernel<256, __nv_bfloat16, __nv_bfloat16>, grid, dim3(256), 0, (cudaStream_t) stream, qf, kk, vv,
                q_norm, k_norm, eps, r, pos, n_head, n_kv, reinterpret_cast<__nv_bfloat16*>(q_out), (__half*) k_cache, (__half*) v_cache, cell0, 512, (int64_t) 0,
-               (const int32_t*) nullptr, q8);
+               (const int32_t*) nullptr, q8, far_kv);
     check("attn_qk_prepare_bf16");
 }
 
@@ -602,13 +951,13 @@ void dyn_conv2(const float* x, const float* dyn, int64_t ld_dyn, const float* ba
 }
 
 void candidate_path(const float* lp_rows, int stride, int top, const float* h, const uint16_t* pred, const uint16_t* succ,
-                    int rank, const int32_t* anchor, int n, int32_t* ids, float* conf, void* stream) {
+                    int rank, const int32_t* anchor, int n, int32_t* ids, float* conf, const CandidateDraw& draw, void* stream) {
     if (n <= 0) return;
-    if (top > 64 || rank % 32 || rank > 1024) {
+    if (top <= 0 || top > 64 || rank <= 0 || rank % 32 || rank > 1024) {
         basalt::log::error("basalt", "candidate_path: %d candidates of rank %d", top, rank);
         std::exit(1);
     }
-    candidate_path_kernel<<<1, rank, (size_t) rank * sizeof(float), (cudaStream_t) stream>>>(lp_rows, stride, top, h, pred, succ, rank, anchor, n, ids, conf);
+    candidate_path_kernel<<<1, rank, (size_t) rank * sizeof(float), (cudaStream_t) stream>>>(lp_rows, stride, top, h, pred, succ, rank, anchor, n, ids, conf, draw);
     check("candidate_path");
 }
 
@@ -625,7 +974,7 @@ void attn_gate_e4m3(const float* attn, const float* q_full, int64_t T, int n_hea
         basalt::log::error("basalt", "attn_gate_e4m3: %d heads", n_head);
         std::abort();
     }
-    attn_gate_e4m3_kernel<float><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(attn, q_full, n_head, codes, scales);
+    attn_gate_token_kernel<float><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(attn, q_full, n_head, codes, scales);
     check("attn_gate_e4m3");
 }
 void attn_gate_e4m3(const uint16_t* attn, const uint16_t* q_full, int64_t T, int n_head, uint8_t* codes, float* scales,
@@ -635,7 +984,7 @@ void attn_gate_e4m3(const uint16_t* attn, const uint16_t* q_full, int64_t T, int
         basalt::log::error("basalt", "attn_gate_e4m3: %d heads", n_head);
         std::abort();
     }
-    attn_gate_e4m3_kernel<__nv_bfloat16, __nv_bfloat16><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
+    attn_gate_token_kernel<__nv_bfloat16, __nv_bfloat16><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(attn), reinterpret_cast<const __nv_bfloat16*>(q_full), n_head, codes, scales);
     check("attn_gate_e4m3");
 }
@@ -645,9 +994,33 @@ void attn_gate_e4m3(const float* attn, const uint16_t* q_full, int64_t T, int n_
         basalt::log::error("basalt", "attn_gate_e4m3: %d heads", n_head);
         std::abort();
     }
-    attn_gate_e4m3_kernel<__nv_bfloat16><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
+    attn_gate_token_kernel<__nv_bfloat16><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
         attn, reinterpret_cast<const __nv_bfloat16*>(q_full), n_head, codes, scales);
     check("attn_gate_e4m3");
+}
+void attn_gate_bf16(const uint16_t* attn, const uint16_t* q_full, int64_t T, int n_head, uint16_t* out, float* rowmax,
+                    void* stream) {
+    if (T <= 0) return;
+    if (n_head * HD > 256 * 4 * 8) {
+        basalt::log::error("basalt", "attn_gate_bf16: %d heads", n_head);
+        std::abort();
+    }
+    attn_gate_token_kernel<__nv_bfloat16, __nv_bfloat16, false><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(attn), reinterpret_cast<const __nv_bfloat16*>(q_full), n_head, nullptr,
+        nullptr, reinterpret_cast<__nv_bfloat16*>(out), rowmax);
+    check("attn_gate_bf16");
+}
+void attn_gate_bf16(const float* attn, const uint16_t* q_full, int64_t T, int n_head, uint16_t* out, float* rowmax,
+                    void* stream) {
+    if (T <= 0) return;
+    if (n_head * HD > 256 * 4 * 8) {
+        basalt::log::error("basalt", "attn_gate_bf16: %d heads", n_head);
+        std::abort();
+    }
+    attn_gate_token_kernel<__nv_bfloat16, float, false><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
+        attn, reinterpret_cast<const __nv_bfloat16*>(q_full), n_head, nullptr, nullptr,
+        reinterpret_cast<__nv_bfloat16*>(out), rowmax);
+    check("attn_gate_bf16");
 }
 
 }  // namespace basalt::kernels

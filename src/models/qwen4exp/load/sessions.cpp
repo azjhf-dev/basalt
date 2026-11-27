@@ -1,5 +1,9 @@
+#include "basalt/core/gpu_mem_info.hpp"
+#include "basalt/core/device_copy.hpp"
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/core/elastic_kv.hpp"
 #include "context.hpp"
+#include "../cli/kv_batch.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -23,7 +27,7 @@ bool stage_preflight(int device, std::string& err) {
     if (const cudaError_t e = cudaGetDevice(&previous); e != cudaSuccess) return fail("cudaGetDevice", e);
     if (const cudaError_t e = cudaSetDevice(device); e != cudaSuccess) return fail("cudaSetDevice", e);
     size_t free_bytes = 0, total_bytes = 0;
-    const cudaError_t e = cudaMemGetInfo(&free_bytes, &total_bytes);
+    const cudaError_t e = basalt::core::gpu_mem_info(&free_bytes, &total_bytes);
     cudaSetDevice(previous);
     return e == cudaSuccess ? true : fail("preflight free memory", e);
 }
@@ -80,10 +84,10 @@ int sessions(Context& context) {
         }
         void* arena_s = nullptr;
         if (cudaMalloc(&arena_s, pool_s) != cudaSuccess ||
-            !st.wt.load(pack_files, arena_s, pool_s, err, skip_s.empty() ? nullptr : &skip_s)) {
+            !st.wt.load(pack_files, arena_s, pool_s, err, skip_s.empty() ? nullptr : &skip_s, true, context.reads)) {
             cudaGetLastError();
             size_t free_b = 0, total_b = 0;   // what that card had free
-            cudaMemGetInfo(&free_b, &total_b);
+            basalt::core::gpu_mem_info(&free_b, &total_b);
             basalt::log::error("basalt generate", "layer split, CUDA%d weights: %s (%llu MiB needed, %llu MiB of %llu "
                                  "MiB free on that card)", st.dev,
                          err.empty() ? "the weight arena does not fit" : err.c_str(),
@@ -91,13 +95,13 @@ int sessions(Context& context) {
                          (unsigned long long) (total_b >> 20));
             return 1;
         }
-        if (!st.dense.load(o.native_shards, st.wt, err, true)) {
+        if (!st.dense.load(o.native_shards, st.wt, err, true, 0, -1, nullptr, 0, context.reads)) {
             basalt::log::error("basalt generate", "layer split, CUDA%d native dense projections: %s", st.dev,
                          err.c_str());
             return 1;
         }
         // this stage's fused hyper-connection reads need its device's copies
-        if (!basalt::core::Verifier::prepare_hc8(st.wt, g, err)) {
+        if (!basalt::core::Verifier::prepare_hc8(st.wt, g, *context.reads, err)) {
             basalt::log::error("basalt generate", "layer split, CUDA%d: %s", st.dev, err.c_str());
             return 1;
         }
@@ -119,7 +123,7 @@ int sessions(Context& context) {
         // kernel its stage runs - set before any of its graphs is captured
         if (o.vision) {
             if (cudaMalloc(&st.mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
-                cudaMemcpy(st.mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
+                basalt::core::device_copy(st.mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
                     cudaSuccess) {
                 basalt::log::error("basalt generate", "layer split, CUDA%d: the image position table failed", st.dev);
                 return 1;
@@ -130,24 +134,18 @@ int sessions(Context& context) {
         st.pcie_frac = o.pcie_frac;
         {
             std::string bursts;
-            const double bw = probe_pcie_h2d_gbps(&bursts);
-            if (bw > 0.0) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
+            const double bw = basalt::core::probe_h2d_gbps(&bursts);
+            if (bw > 0.0 && !o.diag_fixed_experts) st.pcie_frac = pcie_frac_for_gbps(bw, 0.55);
             basalt::log::info("basalt generate", "layer split: CUDA%d PCIe probe %.1f GB/s (best of %s) -> pcie_frac "
                                  "%.2f", st.dev, bw, bursts.c_str(), st.pcie_frac);
         }
         size_t fb = 0, tb = 0;
-        cudaMemGetInfo(&fb, &tb);
+        basalt::core::gpu_mem_info(&fb, &tb);
         basalt::log::info("basalt generate", "layer split: CUDA%d holds its weights; %.2f GiB free (its session "
                              "follows the split search)", st.dev, (double) fb / 1073741824.0);
     }
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
 
-    for (size_t i = 0; i < split_at.size(); ++i)
-        if (split_at[i] >= g.n_layers) {
-            basalt::log::error("basalt generate", "--layer-split: layer %lld is past the last (%lld)",
-                         (long long) split_at[i], (long long) (g.n_layers - 1));
-            return 2;
-        }
     // the stage that runs a layer (0: CUDA0's)
     auto stage_of = [&](int64_t l) -> int {
         int st = 0;
@@ -170,14 +168,13 @@ int sessions(Context& context) {
     }
 
     uint64_t solo_kv_bytes = 0;   // the solo session's state on CUDA0, reported once it is known to be a session of its own
-    // ---- THE ELASTIC KV.  A server on one GPU backs only the first kKvElasticFloor cells of each session's K/V pools at
+    // ---- THE ELASTIC KV.  A server on one GPU backs only the first core::kElasticKvBase cells of each session's K/V pools at
     // start; the rest of their VRAM goes to the expert cache as its tail, and a request that needs more cells takes
     // them back from that tail (kv_fit below), so a short request decodes with the larger cache.  Not with KV
     // streaming (its pools are a fixed set of VRAM pages) nor with --vram-elastic (that resizes the same tail).
     // With --batch a session's base is smaller: the slots' sessions are many, and an idle or short one would hold its
     // whole base out of the expert cache.
-    constexpr int64_t kKvElasticFloor = 32768, kKvElasticFloorBatch = 4096;
-    const int64_t kv_base = o.batch > 0 ? kKvElasticFloorBatch : kKvElasticFloor;
+    const int64_t kv_base = o.batch > 0 ? basalt::core::kElasticKvBaseBatch : basalt::core::kElasticKvBase;
     const int64_t kv_floor = o.serve && !multi_gpu && o.kv_resident == 0 && !o.vram_elastic &&
                              o.max_context > kv_base ? kv_base : 0;
     basalt::core::qsa_set_kv_elastic(kv_floor);
@@ -232,14 +229,19 @@ int sessions(Context& context) {
         const bool last = i + 1 == stages.size();
         const basalt::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
-            (last && !st.head.load(o.native_shards, g.n_embd, wo_s->ne1, err))) {
+            (last && !st.head.load(o.native_shards, g.n_embd, wo_s->ne1, *context.reads, err))) {
             basalt::log::error("basalt generate", "layer split, CUDA%d head: %s%s", st.dev,
                          wo_s == nullptr ? "output.weight is missing" : err.c_str(),
                          wo_s == nullptr ? "" : vram_free_note().c_str());
             return 1;
         }
+        if (last)
+            context.after->push_back([&st](std::string& e) {
+                const basalt::core::OnDevice on(st.dev);
+                return st.head.finish(e);
+            });
         size_t fb = 0, tb = 0;
-        cudaMemGetInfo(&fb, &tb);
+        basalt::core::gpu_mem_info(&fb, &tb);
         basalt::log::info("basalt generate", "layer split: CUDA%d holds its weights, session [%lld, %lld)%s; "
                              "%.2f GiB free", st.dev, (long long) st.lb, (long long) st.le,
                      last ? " and the head" : "", (double) fb / 1073741824.0);
@@ -255,7 +257,9 @@ int sessions(Context& context) {
     bool slot0_is_solo = false;      // slot 0 is the solo session (no separate solo state)
     if (o.batch != 0) {
         const int cap = basalt::kernels::kVerifyMaxT;
-        const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
+        // one slot of a KV format batch windows cannot read is no slot: requests run one at a time, as without --batch
+        const char* off = !o.serve ? "it needs --serve" : o.batch < 1 ? "it needs 1 or more slots"
+                        : o.batch == 1 && !cli::kv_batch_refusal(o.kv, 2).empty() ? "one slot runs batch windows only with --kv int8"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
             basalt::log::warn("basalt generate", "--batch %d is off: %s", o.batch, off);
@@ -266,10 +270,12 @@ int sessions(Context& context) {
             o.batch = cap;
         }
     }
-    if (o.batch > 0 && o.batch_groups > 1 && (stages.empty() || o.batch % o.batch_groups != 0)) {
-        basalt::log::warn("basalt generate", "--batch-groups %d needs a layer split and to divide --batch %d; "
-                             "one group", o.batch_groups, o.batch);
-        o.batch_groups = 1;
+    if (o.batch > 0) {
+        const std::string why = cli::kv_batch_refusal(o.kv, o.batch);
+        if (!why.empty()) {
+            basalt::log::error("basalt generate", "%s", why.c_str());
+            return 1;
+        }
     }
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
@@ -296,7 +302,7 @@ int sessions(Context& context) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
-                    cudaMemGetInfo(&fb, &tb);
+                    basalt::core::gpu_mem_info(&fb, &tb);
                     basalt::log::warn("basalt generate", "--batch %d: slot %d's session does not fit on CUDA%d "
                                          "(%.2f GiB, %.2f GiB free); %d slot%s", o.batch, b, dev,
                                  (double) bytes / 1073741824.0, (double) fb / 1073741824.0, b, b == 1 ? "" : "s");
@@ -311,13 +317,13 @@ int sessions(Context& context) {
             }
             cudaDeviceSynchronize();
             size_t fb = 0, tb = 0;
-            cudaMemGetInfo(&fb, &tb);
+            basalt::core::gpu_mem_info(&fb, &tb);
             basalt::log::info("basalt generate", "--batch: %d slot sessions on CUDA%d (%.2f GiB in all); %.2f GiB free",
                          (int) bslot_ss[k].size(), dev, (double) total / 1073741824.0, (double) fb / 1073741824.0);
         }
         for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
-        if (fit < 2) {
-            basalt::log::warn("basalt generate", "--batch is off: not two slot sessions fit (a smaller "
+        if (fit < 1) {
+            basalt::log::warn("basalt generate", "--batch is off: no slot session fits (a smaller "
                                  "--max-context, or KV streaming, --kv-resident, makes them smaller)");
             bslot_ss.clear();
             slot_cap.clear();
@@ -337,7 +343,6 @@ int sessions(Context& context) {
                         sb + basalt::core::session_kv_bytes_for(u, u.max_cells));
                 }
             slot_cap.resize((size_t) fit);
-            if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
             // the sessions' VRAM is the expert cache's: say what it costs (the slots carved on CUDA0 may be fewer than
             // were first carved when a later stage ran out)
             uint64_t kept = 0;
@@ -371,7 +376,7 @@ int sessions(Context& context) {
         static const basalt::core::ModelGeometry draft_geometry{};
         // with a layer split across GPUs the drafter stays on CUDA0 (the fastest card) and reads the last stage's
         // residual rows through a relay
-        if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, ss, pipe_want ? basalt::core::kMtpChainMax : o.spec, err, o.mtp_window)) { basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(basalt::core::MtpFiles::from(srcs), draft_geometry, ss, pipe_want ? basalt::core::kMtpChainMax : o.spec, *context.reads, err, o.mtp_window)) { basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
     }
     basalt::core::qsa_set_kv_elastic(0);   // every later state: whole
@@ -404,17 +409,25 @@ int sessions(Context& context) {
     basalt::core::NativeHead native_head;
     basalt::core::NativeHead mtp_head;   // a layer split: the drafter's copy of the head on CUDA0
     if (multi_gpu && mtp_on) {
-        if (!mtp_head.load(o.native_shards, g.n_embd, n_vocab, err)) {
+        if (!mtp_head.load(o.native_shards, g.n_embd, n_vocab, *context.reads, err)) {
             basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
             return 1;
         }
+        context.after->push_back([&mtp_head](std::string& e) {
+            const basalt::core::OnDevice on(0);
+            return mtp_head.finish(e);
+        });
     }
     if (!multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
-        if (!native_head.load(o.native_shards, g.n_embd, n_vocab, err)) {
+        if (!native_head.load(o.native_shards, g.n_embd, n_vocab, *context.reads, err)) {
             basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
             return 1;
         }
+        context.after->push_back([&native_head](std::string& e) {
+            const basalt::core::OnDevice on(0);
+            return native_head.finish(e);
+        });
         basalt::log::info("basalt generate", "native head: %s, %llu bytes, in %.1f s",
                      basalt::ggml_type_name((uint32_t) native_head.type()),
                      (unsigned long long) native_head.weight_bytes(),
