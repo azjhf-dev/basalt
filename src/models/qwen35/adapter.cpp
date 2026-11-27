@@ -152,6 +152,8 @@ public:
 
     model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override {
         if (std::string err; !dense::attach_drafter(*model_, err)) return {model::Status::Error, err};
+        if (!lora_.pairs().empty())
+            if (std::string err; !dense::attach_lora(*model_, err)) return {model::Status::Error, err};
         if (stage_.device >= 0) {
             std::string err;
             if (!dense::warm_prompt_split(*model_, err)) return {model::Status::Error, err};
@@ -195,7 +197,7 @@ private:
         }
         for (const TensorInfo& t : gg.tensors()) tensors_[t.name] = t;
         dense::Options o = run_options(gg, req.max_context, req.sessions, req.spec, req.draft, req.vision, req.kv, req.kv_resident);
-        if (!req.lora.empty()) {   // a runtime LoRA adapter (dense/lora.hpp): host-validated here, applied from iteration 3
+        if (!req.lora.empty()) {   // a runtime LoRA adapter (dense/lora.hpp): host-validated here, uploaded in attach()
             if (req.gpus.cards.size() > 1) {
                 err = "qwen35: --lora does not run multi-card yet (the second card would need its own adapter copy)";
                 return false;
@@ -207,7 +209,6 @@ private:
             basalt::log::info("basalt qwen35", "lora: %zu adapted projections, rank %d, scale %.4g, %.2f MiB from %s%s", npairs,
                               lora_.rank(), (double) lora_.scale(), (double) lora_.bytes() / 1048576.0, req.lora.c_str(),
                               lora_.alpha_defaulted() ? "; the file has no alpha, the scale is --lora-scale alone" : "");
-            basalt::log::warn("basalt qwen35", "lora: the adapter is loaded and checked but not applied yet (fork iteration 3)");
         }
         const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
         dense::BlockDrafter bd_meta;

@@ -2,12 +2,14 @@
 #pragma once
 
 #include "basalt/dense/model.hpp"
+#include "basalt/dense/lora.hpp"
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <functional>
 #include <memory>
 #include <string>
@@ -31,6 +33,17 @@ constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: th
 constexpr int kTypeF8 = 44;       // F8_E4M3 projections (Linear::type)
 constexpr int kTypeQ8P = 108;     // Q8_0 in planes (window_gemm Format::Q8), made at load for the decode window
 constexpr int kTypeNvfp4Planes = 45;   // NVFP4_PLANES matrices (Linear::type, nvfp4_planes.hpp)
+
+/// One adapted projection's device copy (attach_lora): the factor rows fp16 on the card in the GGUF's storage
+/// (a [in][r] with `in` fastest, b [r][out] with `r` fastest), the adapter's scale folded with the run's
+/// (--lora-scale).  A null `a` is an unadapted projection.
+struct LoraDev {
+    const uint16_t* a = nullptr;
+    const uint16_t* b = nullptr;
+    int64_t in = 0, out = 0;
+    int r = 0;
+    float scale = 0.0f;
+};
 
 /// Device buffers carved from one allocation.
 class Arena {
@@ -68,6 +81,8 @@ struct WindowScratch {
     float *qfull = nullptr, *k = nullptr, *v = nullptr, *qo = nullptr, *ao = nullptr, *ag = nullptr;
     float *g = nullptr, *u = nullptr, *h = nullptr;
     float* attn = nullptr;                       // gqa_decode_attn's partial sums
+    float* lora_delta = nullptr;                 // attach_lora's: [kBatch][n_embd] a residual-adding target's delta
+    float* lora_r = nullptr;                     // [kBatch][rank] the A product of the target in hand
     int32_t *tok = nullptr, *pos = nullptr;      // the window's tokens and [row][3] positions (device)
     float* cat = nullptr;                        // the drafter's [embedding | hidden] rows
     float *lp = nullptr, *lp_scratch = nullptr;  // the drafter's picks (row_logprobs rows) and their scratch
@@ -99,6 +114,8 @@ struct ChunkScratch {
     void* a4 = nullptr;                           // the FP4 activations (fp4_dense), their token scales
     float* gs = nullptr;
     float* hmax = nullptr;                        // each row's largest |H| (the SwiGLU product's), for its FP4 rounding
+    float* lora_delta = nullptr;                  // attach_lora's: [kChunk][n_embd] a residual-adding target's delta
+    float* lora_r = nullptr;                      // [kChunk][rank] the A product of the target in hand
     int32_t *tok = nullptr, *pos = nullptr, *iota = nullptr, *bounds = nullptr;
 };
 
@@ -139,6 +156,7 @@ public:
     cudaEvent_t stage_free = nullptr, stage_ready = nullptr;
     std::unique_ptr<prefill::mmq::Context> mmq;
     int lb = 0, le = 0;                          // the layers this card runs: [lb, le)
+    std::vector<std::array<LoraDev, kLoraTargets>> lora_w;   // attach_lora's device copies, per layer and target ({}: no adapter)
     int n_gdn = 0, n_attn = 0;                   // the GDN and attention layers among them
     std::vector<int> gdn_index, attn_index;      // per layer: its index among the card's GDN or attention layers (-1)
     // the batch windows' graphs, one per composition (model/batch_driver.hpp captures them on one card; a layer split's

@@ -152,6 +152,10 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
 /// Once the weights have landed (make_model takes them still to be read): the forms decode windows read made from them
 /// (the block drafter's planes and copies).
 bool attach_drafter(Model& m, std::string& err);
+/// The run's LoRA adapter (Options::lora, dense/lora.hpp) uploaded to the card: per layer and target its factors'
+/// device copies and the products' scratch (forward.cpp's lora_add / lora_residual).  Called after make_model, on
+/// the model's card.  True with no adapter.
+bool attach_lora(Model& m, std::string& err);
 std::unique_ptr<model::ModelSession> make_session(Model& m, std::string& err);
 /// Layers a prompt split's card may hold (the last ones): the most its share's cut puts there.
 constexpr int kPromptSplitLayers = 20;

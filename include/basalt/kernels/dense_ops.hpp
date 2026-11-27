@@ -108,4 +108,11 @@ void candidate_path(const float* lp_rows, int stride, int top, const float* h, c
                     int rank, const int32_t* anchor, int n, int32_t* ids, float* conf, const CandidateDraw& draw,
                     void* stream);
 
+/// A runtime LoRA adapter's two products (docs/lora.md): tmp[t][k] = x[t] . a[k] for the adapter's fp16 factor A
+/// [R][K] (the GGUF's storage), x fp32 [T][K]; then y[t][n] = or += scale * tmp[t] . b[n] for fp16 B [N][R], y fp32
+/// [T][N] (`add` chooses = or +=).  Rank R is small; fp32 accumulation throughout.
+void lora_product_a(const float* x, const uint16_t* a, float* tmp, int64_t T, int64_t R, int64_t K, void* stream);
+void lora_product_b(const float* tmp, const uint16_t* b, float* y, float scale, int64_t T, int64_t N, int64_t R,
+                    bool add, void* stream);
+
 }  // namespace basalt::kernels

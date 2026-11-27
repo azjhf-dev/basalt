@@ -313,6 +313,62 @@ bool attach_drafter(Model& m, std::string& err) {
     return true;
 }
 
+bool attach_lora(Model& m, std::string& err) {
+    const LoraAdapter* ad = m.o.lora;
+    if (!ad) return true;
+    m.lora_w.assign((size_t) m.g.n_layers, {});
+    uint64_t bytes = 0;
+    size_t npairs = 0;
+    for (const LoraPair& p : ad->pairs()) {
+        if (!p.a) continue;
+        if (p.layer < m.lb || p.layer >= m.le) continue;   // another card's layer (v1 refuses --lora multi-card)
+        if (p.type != 1) {   // ggml F16; an F32 adapter converts offline for now
+            err = m.o.arch + ": --lora applies F16 adapters; this one stores its factors in F32 (convert it to F16)";
+            return false;
+        }
+        LoraDev d;
+        d.in = p.in;
+        d.out = p.out;
+        d.r = ad->rank();
+        d.scale = ad->scale();
+        const size_t ab = (size_t) p.in * (size_t) d.r * 2, bb = (size_t) d.r * (size_t) p.out * 2;
+        void *da = nullptr, *db = nullptr;
+        if (cudaMalloc(&da, ab) != cudaSuccess || cudaMalloc(&db, bb) != cudaSuccess ||
+            cudaMemcpy(da, p.a, ab, cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(db, p.b, bb, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaGetLastError();
+            err = m.o.arch + ": no device memory for the LoRA adapter (" +
+                  std::to_string((unsigned long long) (ad->bytes() >> 20)) + " MiB)";
+            return false;
+        }
+        d.a = (const uint16_t*) da;
+        d.b = (const uint16_t*) db;
+        m.owned.push_back(da);
+        m.owned.push_back(db);
+        m.lora_w[(size_t) p.layer][(int) p.target] = d;
+        bytes += ab + bb;
+        ++npairs;
+    }
+    // the products' scratch: one rank-wide buffer and, for the targets that add into the BF16 residual (attention
+    // out, FFN down), one fp32 row set the delta is built in; window rows and chunk rows in one allocation
+    const size_t H = (size_t) m.g.n_embd, R = (size_t) ad->rank();
+    float* sc = nullptr;
+    const size_t floats = ((size_t) kBatch + (size_t) kChunk) * (H + R);
+    if (cudaMalloc(&sc, floats * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        err = m.o.arch + ": no device memory for the LoRA scratch";
+        return false;
+    }
+    m.owned.push_back(sc);
+    m.ws.lora_delta = sc;
+    m.ws.lora_r = sc + (size_t) kBatch * H;
+    m.cs.lora_delta = sc + (size_t) kBatch * (H + R);
+    m.cs.lora_r = m.cs.lora_delta + (size_t) kChunk * H;
+    basalt::log::info("basalt dense", "lora: %zu projections, rank %d, scale %.4g, %.2f MiB on the card", npairs, ad->rank(),
+                      (double) ad->scale(), (double) bytes / 1048576.0);
+    return true;
+}
+
 namespace {
 // a cell of one attention layer, K and V: fp16 (format 0), int8 codes with their fp16 scales (1), or NVFP4 codes with their
 // E4M3 scales (2)

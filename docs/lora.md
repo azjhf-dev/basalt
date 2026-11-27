@@ -3,7 +3,7 @@
 Fork-only feature branch: `lora-adapter` on azjhf-dev/basalt. Nothing here is proposed upstream.
 Pinned base: jesdga95/basalt @ `d0f35a8f` (`git describe`: v0.5.7-157-gd0f35a8f, 2026-11-26).
 
-Status: **iteration 2 — loader, CLI plumbing, and contract tests landed on branch `lora-adapter`. The adapter loads and validates on CPU; weights are not applied yet (iteration 3, GPU).**
+Status: **iteration 3 — the adapter is applied: device upload (attach_lora), the two factor products as CUDA kernels, and injection into every decode-window, batch-window and prompt-chunk path of the dense stack, plus the parity harness scaffold. Compiles and runs need Ash's 5090 (no local CUDA toolchain); the parity run gates iteration 4.**
 
 Upstream asks for this in jesdga95/basalt#418 (open since 2026-11-18, no maintainer reply):
 `--lora adapter.gguf --lora-scale 0.8`, multiple adapters, swap without reloading the base.
@@ -88,14 +88,34 @@ covers both. Decode windows are captured as CUDA graphs per row count; the LoRA 
 inside them, legal because adapter weights and the scale are device constants at capture time. A
 scale change or adapter swap updates device memory only — no recapture.
 
+### Where the delta joins (iteration 3)
+
+`attach_lora` (src/dense/model.cpp) uploads the factors fp16 to the card, one `LoraDev` per layer and target
+(Model::lora_w), plus scratch (one rank-wide buffer per path, one fp32 row set for the residual-adding targets).
+The products are two small kernels (src/kernels/cuda/lora_ops.cu): `tmp = x·A` a warp per (row, k), `y += scale·tmp·B`
+a thread per (row, n), fp32 accumulation, same ordering as `lora_apply_ref`. Injection points (src/dense/forward.cpp):
+
+- q/k/v: into the product's fp32 rows right after prod_group / gemm, from the normed input (`lora_add`).
+- gate/up: with an adapter the fused SwiGLU epilogue has no room for the delta, so the run takes the two-product
+  path (scaled products, deltas, then SwiGLU) — window and chunk alike.
+- attention out / FFN down (outputs that land in the BF16 residual): the delta is built in fp32 scratch and added
+  with add_scaled — one more rounding than the fused epilogue's single add, the documented v1 difference.
+  The attention merge runs ungated when the adapter targets o_proj (the delta needs the gated fp32 rows).
+- prompt chunks: with an adapter the F8/NVFP4 fused chunk paths (BF16 intermediates, norm fused in the quantizer)
+  give way to the FP32 path, whose rows the deltas join; prompt throughput drops, decode is untouched. Bringing
+  the delta into the fused chunk kernels is an iteration-4+ perf item.
+- drafters (MTP / block): no adapter tensors, run the base weights as before (target verifies; output stays exact).
+
+The memory planner's figures (shared_bytes et al.) do not yet include the adapter (~0.9 GiB) and its scratch (~90
+MiB); plan with that headroom until they do.
+
 ### Cost estimate
 
 Per targeted projection the two factor products add `2·r·(in+out)` FLOPs against `in·out` for the
 base, e.g. q_proj ≈ 5.3%, ffn_down ≈ 4.9%. Across a full layer: roughly 4-5% more decode math,
 before the fixed cost of two small kernel launches per product (dominant at window size 1-16;
-batched windows and drafted windows amortize it). Prompt chunks are compute-bound GEMMs; the small
-GEMMs add ~13 extra launches per layer per chunk. Expect a low-single-digit % decode slowdown and a
-larger but still small prompt cost; to be measured, not guessed, in iteration 3.
+batched windows and drafted windows amortize it). Prompt chunks take the unfused FP32 path while an
+adapter is on (see above), the bigger cost; both to be measured, not guessed, in iteration 4.
 
 ### Drafters, vision, multi-card
 
@@ -124,14 +144,16 @@ Reference implementation: llama.cpp at a pinned commit, serving the card's exact
    Landed: `src/dense/lora_test.cpp` (8 fixture checks plus real-file mode) and
    `tools/lora/verify_adapter.py` (GGUF↔PEFT container cross-check; all 512 tensors match, max abs
    diff 7.1e-06 = F16 rounding).
-2. **Delta parity on GPU (iteration 3, needs Ash's 5090).** llama.cpp's own numbers on an NVFP4/FP8
+2. **Delta parity on GPU (iteration 3's run, on Ash's 5090).** llama.cpp's own numbers on an NVFP4/FP8
    base do not exist, so absolute logits against it are dominated by the base quant difference.
    Instead compare *deltas*: for a fixed prompt set, the logit change from adding the adapter must
    match between engines — cosine similarity and KL of (logits_lora − logits_base) per position,
    plus top-1 agreement of the adapted models, plus exact-match greedy decodes (256 tokens) on a
    handful of code and prose prompts. The NVFP4/FP8 base will sit further from the evaluated BF16
    behavior than llama.cpp's Q8_0 base does (the card warns lower-bit quants drift); the delta
-   comparison isolates our implementation from that known drift.
+   comparison isolates our implementation from that known drift. Harness: `tools/lora/parity.py`
+   (builds llama.cpp at the pinned commit, runs both engines base and adapted, compares greedy
+   decodes and reported logits).
 3. **Optional gold run:** PEFT merge on CPU (Ash's 128 GB box can hold BF16) for a couple of prompts
    as the outer anchor.
 

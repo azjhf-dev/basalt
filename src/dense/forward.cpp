@@ -158,10 +158,49 @@ void prod_add(Model& m, const Linear& l, const void* yq, uint16_t* x, int T, cud
     mmq_run(m, l, yq, m.ws.tmp, T, s);
     kernels::add_scaled(x, m.ws.tmp, l.scale, (int64_t) T * l.rows, s);
 }
+// ---- runtime LoRA (docs/lora.md): attach_lora put the adapter's fp16 factors on the card (m.lora_w); the helpers
+// add scale * (x . A) . B into a linear's fp32 output, or into a fp32 scratch that joins the BF16 residual (one more
+// rounding than the fused epilogue's single add, documented in docs/lora.md).
+
+// layer il's adapter pairs (one per target, the unadapted ones null), null when the run has no adapter; the
+// drafter's layers pass il -1 and so never see one (the target verifies: its output stays the pack's exact output)
+const LoraDev* lora_layer(Model& m, int il) {
+    return il >= 0 && !m.lora_w.empty() ? m.lora_w[(size_t) il].data() : nullptr;
+}
+
+// y[T][out] += scale * (x . A) . B, x the rows the base product read (before its quantization)
+void lora_add(Model& m, const LoraDev* d, const float* x, float* y, int T, float* rbuf, cudaStream_t s) {
+    if (!d || !d->a) return;
+    kernels::lora_product_a(x, d->a, rbuf, T, d->r, d->in, s);
+    kernels::lora_product_b(rbuf, d->b, y, d->scale, T, d->out, d->r, true, s);
+}
+
+// the same delta built in `delta` and added into the BF16 residual rows
+void lora_residual(Model& m, const LoraDev* d, const float* x, uint16_t* res, float* delta, float* rbuf, int T,
+                   cudaStream_t s) {
+    if (!d || !d->a) return;
+    cudaMemsetAsync(delta, 0, (size_t) T * (size_t) d->out * sizeof(float), s);
+    kernels::lora_product_a(x, d->a, rbuf, T, d->r, d->in, s);
+    kernels::lora_product_b(rbuf, d->b, delta, d->scale, T, d->out, d->r, false, s);
+    kernels::add_scaled(res, delta, nullptr, (int64_t) T * d->out, s);
+}
+
 // h [T][rows] = silu(s_g gate x) (s_u up x): one window gemm call with the SwiGLU epilogue, which can also leave h as the
-// next product's bf16 rows (`h16`; h may then be null)
+// next product's bf16 rows (`h16`; h may then be null).  With an adapter (lg / lu): the delta joins each product, so
+// the fused epilogues are out - two scaled products, the deltas, then SwiGLU.
 void prod_swiglu(Model& m, const Linear& gate, const Linear& up, const float* x, const void* xq, float* h, int T,
-                 cudaStream_t s, void* h16 = nullptr) {
+                 cudaStream_t s, void* h16 = nullptr, const LoraDev* lg = nullptr, const LoraDev* lu = nullptr) {
+    WindowScratch& b = m.ws;
+    if (lg || lu) {
+        prod(m, gate, xq, b.g, T, s);
+        lora_add(m, lg, x, b.g, T, b.lora_r, s);
+        if (up.type != gate.type) xq = wact(m, x, up.type, up.cols, T, s);
+        prod(m, up, xq, b.u, T, s);
+        lora_add(m, lu, x, b.u, T, b.lora_r, s);
+        kernels::swiglu_scaled(b.g, b.u, nullptr, nullptr, h, T, gate.rows, gate.rows, s);
+        if (h16) wg::pack(h, gate.rows, gate.rows, T, h16, s);
+        return;
+    }
     if (gate.type == kTypeNvfp4Planes && up.type == gate.type) {
         wg::Call c = wcall(gate, wg::Epilogue::SwiGLU);
         c.n = 2;
@@ -171,7 +210,6 @@ void prod_swiglu(Model& m, const Linear& gate, const Linear& up, const float* x,
         wg::gemm(c, xq, T, m.ws.w8, s);
         return;
     }
-    WindowScratch& b = m.ws;
     if (on_wg(gate.type)) {   // two products (their scales applied), then SwiGLU
         prod_group(m, x, xq, gate.type, {{&gate, b.g}, {&up, b.u}}, T, s);
         kernels::swiglu_scaled(b.g, b.u, nullptr, nullptr, h, T, gate.rows, gate.rows, s);
@@ -231,18 +269,21 @@ void text_positions(std::vector<int32_t>& p3, int T, int64_t pos, int64_t delta)
 // ---- decode window layers: the residual rows are m.ws.x
 
 // the gated attention output's product: gate, ready and add into the residual rows (on the window gemm the attention
-// merge left the gated bf16 rows in m.ws.xq)
-void win_attn_out(Model& m, const Layer& L, int T, cudaStream_t s) {
+// merge left the gated bf16 rows in m.ws.xq; an adapter's output delta needs the fp32 rows, so its run merges ungated
+// and gates here), then the adapter's delta from the gated rows
+void win_attn_out(Model& m, const Layer& L, const LoraDev* lw, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
+    const LoraDev* lo = lw ? &lw[(int) LoraTarget::AttnOutput] : nullptr;
     const void* yq;
-    if (on_wg(L.o.type)) {
+    if (on_wg(L.o.type) && !(lo && lo->a)) {
         yq = b.xq;
     } else {
         kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
         yq = wact(m, b.ag, L.o.type, (int64_t) g.n_head * g.head_dim, T, s);
     }
     prod_add(m, L.o, yq, b.x, T, s);
+    lora_residual(m, lo, b.ag, b.x, b.lora_delta, b.lora_r, T, s);
 }
 
 // a GDN layer's recurrence arguments but its rows and state (the window's: the qkv rows, b.xn, b.z in, b.y out)
@@ -271,19 +312,22 @@ kernels::DecRecArgs gdn_args(Model& m, const Layer& L) {
     return a;
 }
 
-void win_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
+void win_attn(Model& m, const Layer& L, const LoraDev* lw, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
               kernels::KvInt8 q8 = {}, kernels::KvFar far_kv = {}) {
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.q.type, H, T, g.eps, s);
     prod_group(m, b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, T, s);
+    lora_add(m, lw ? &lw[(int) LoraTarget::AttnQ] : nullptr, b.xn, b.qfull, T, b.lora_r, s);
+    lora_add(m, lw ? &lw[(int) LoraTarget::AttnK] : nullptr, b.xn, b.k, T, b.lora_r, s);
+    lora_add(m, lw ? &lw[(int) LoraTarget::AttnV] : nullptr, b.xn, b.v, T, b.lora_r, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
                              pos, s, 256, true, 0, b.pos0, q8, far_kv);
-    const bool gated = on_wg(L.o.type);   // the merge gates and readies the rows for o
+    const bool gated = on_wg(L.o.type) && !(lw && lw[(int) LoraTarget::AttnOutput].a);   // the merge gates and readies the rows for o
     kernels::gqa_decode_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.attn, m.o.max_context, gated ? nullptr : b.ao, s, b.pos0, q8,
                              gated ? b.qfull : nullptr, gated ? (uint16_t*) b.xq : nullptr, far_kv);
-    win_attn_out(m, L, T, s);
+    win_attn_out(m, L, lw, T, s);
 }
 
 void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s) {
@@ -305,11 +349,20 @@ void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStre
     prod_add(m, L.out, on_wg(L.out.type) ? b.xq : wact(m, b.y, L.out.type, g.value_width(), T, s), b.x, T, s);
 }
 
-void win_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
+void win_ffn(Model& m, const Layer& L, const LoraDev* lw, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const int H = g.n_embd;
+    const LoraDev* lg = lw ? &lw[(int) LoraTarget::FfnGate] : nullptr;
+    const LoraDev* lu = lw ? &lw[(int) LoraTarget::FfnUp] : nullptr;
+    const LoraDev* ld = lw ? &lw[(int) LoraTarget::FfnDown] : nullptr;
     const void* xq = wnorm(m, b.x, L.ffn_norm, b.xn, L.gate.type, H, T, g.eps, s);
+    if ((lg && lg->a) || (lu && lu->a) || (ld && ld->a)) {   // h fp32 for the down delta, the fused paths out (prod_swiglu's)
+        prod_swiglu(m, L.gate, L.up, b.xn, xq, b.h, T, s, nullptr, lg, lu);
+        prod_add(m, L.down, wact(m, b.h, L.down.type, g.n_ff, T, s), b.x, T, s);
+        lora_residual(m, ld, b.h, b.x, b.lora_delta, b.lora_r, T, s);
+        return;
+    }
     if (on_wg(L.down.type)) {   // h straight into the down product's bf16 rows
         prod_swiglu(m, L.gate, L.up, b.xn, xq, nullptr, T, s, b.hq);
         prod_add(m, L.down, b.hq, b.x, T, s);
@@ -409,13 +462,13 @@ kernels::KvInt8 prompt_cells(Model& m, const kernels::KvInt8& q8, int64_t cells,
 // `cells_only`: nothing reads the layer's rows (a chunk's last layer), so only its K and V cells are made: the same k
 // and v products and the same cache write, without the queries, the attention and the output projection.  `far`: a
 // streamed cache's far cells (the chunk's rows are written there and read from the stage; stage_prefetch has run).
-void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
+void chunk_attn(Model& m, const Layer& L, const LoraDev* lw, uint16_t* kc, uint16_t* vc, int T, int64_t pos, cudaStream_t s,
                 kernels::KvInt8 q8 = {}, bool cells_only = false, kernels::KvFar far_kv = {}) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim;
     const bool f8 = all_f8({&L.q, &L.k, &L.v, &L.o}), nvfp4 = all_nvfp4({&L.q, &L.k, &L.v, &L.o});
-    if (f8 || nvfp4) {
+    if ((f8 || nvfp4) && !lw) {   // an adapter's run takes the FP32 path below: its deltas join the products' fp32 rows
         // the norm in the quantizer, the q, k and v products BF16 out (F8: one product), the gate's rows straight to E4M3 for
         // an F8 o, else to BF16 rows with each row's amax, read once by o's FP4 quantizer
         const auto product = [&](const Linear& l, float* dst) {
@@ -469,21 +522,27 @@ void chunk_attn(Model& m, const Layer& L, uint16_t* kc, uint16_t* vc, int T, int
         chunk_act(m, b.xn, L.k.type, H, T, s);
         gemm(m, L.k, b.k, T, s);
         gemm(m, L.v, b.v, T, s);
+        lora_add(m, lw ? &lw[(int) LoraTarget::AttnK] : nullptr, b.xn, b.k, T, b.lora_r, s);
+        lora_add(m, lw ? &lw[(int) LoraTarget::AttnV] : nullptr, b.xn, b.v, T, b.lora_r, s);
         kernels::attn_qk_prepare(nullptr, b.k, b.v, nullptr, L.k_norm, g.eps, g.rope, b.pos, T, 0, g.n_kv, nullptr, kc, vc, pos, s,
                                  256, true, 0, nullptr, q8, far_kv);
         return;
     }
     chunk_act(m, b.xn, L.q.type, H, T, s);
     gemm(m, L.q, b.qfull, T, s);
+    lora_add(m, lw ? &lw[(int) LoraTarget::AttnQ] : nullptr, b.xn, b.qfull, T, b.lora_r, s);
     if (L.k.type != L.q.type) chunk_act(m, b.xn, L.k.type, H, T, s);
     gemm(m, L.k, b.k, T, s);
+    lora_add(m, lw ? &lw[(int) LoraTarget::AttnK] : nullptr, b.xn, b.k, T, b.lora_r, s);
     gemm(m, L.v, b.v, T, s);
+    lora_add(m, lw ? &lw[(int) LoraTarget::AttnV] : nullptr, b.xn, b.v, T, b.lora_r, s);
     kernels::attn_qk_prepare(b.qfull, b.k, b.v, L.q_norm, L.k_norm, g.eps, g.rope, b.pos, T, g.n_head, g.n_kv, b.qo, kc, vc,
                              pos, s, 256, true, 0, nullptr, q8, far_kv);
     kernels::gqa_prompt_attn(b.qo, kc, vc, g.n_head, g.n_kv, pos, T, b.ao, s, prompt_cells(m, q8, pos + T, s), b.attn_split,
                              kernels::gqa_prompt_split_floats(kChunk, g.n_head, kAttnSplits), stage_far(m, far_kv, pos, T, s));
     kernels::attn_gate(b.ao, b.qfull, b.ag, T, g.n_head, s);
     chunk_residual(m, L.o, b.ag, AQ, T, s);
+    lora_residual(m, lw ? &lw[(int) LoraTarget::AttnOutput] : nullptr, b.ag, residual(b), b.lora_delta, b.lora_r, T, s);
 }
 
 void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStream_t s) {
@@ -533,10 +592,26 @@ void chunk_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaSt
 }
 
 
-void chunk_ffn(Model& m, const Layer& L, int T, cudaStream_t s) {
+void chunk_ffn(Model& m, const Layer& L, const LoraDev* lw, int T, cudaStream_t s) {
     const Geometry& g = m.g;
     ChunkScratch& b = m.cs;
     const int H = g.n_embd;
+    const LoraDev* lg = lw ? &lw[(int) LoraTarget::FfnGate] : nullptr;
+    const LoraDev* lu = lw ? &lw[(int) LoraTarget::FfnUp] : nullptr;
+    const LoraDev* ld = lw ? &lw[(int) LoraTarget::FfnDown] : nullptr;
+    if ((lg && lg->a) || (lu && lu->a) || (ld && ld->a)) {   // the FP32 path: the deltas join the products' fp32 rows
+        kernels::rms_norm_rows(residual(b), L.ffn_norm, b.xn, T, H, g.eps, s);
+        chunk_act(m, b.xn, L.gate.type, H, T, s);
+        gemm(m, L.gate, b.g, T, s);
+        lora_add(m, lg, b.xn, b.g, T, b.lora_r, s);
+        if (L.up.type != L.gate.type) chunk_act(m, b.xn, L.up.type, H, T, s);
+        gemm(m, L.up, b.u, T, s);
+        lora_add(m, lu, b.xn, b.u, T, b.lora_r, s);
+        kernels::swiglu_scaled(b.g, b.u, post_scale(L.gate), post_scale(L.up), b.h, T, g.n_ff, g.n_ff, s);
+        chunk_residual(m, L.down, b.h, g.n_ff, T, s);
+        lora_residual(m, ld, b.h, residual(b), b.lora_delta, b.lora_r, T, s);
+        return;
+    }
     if (L.gate.type == kTypeNvfp4Planes && L.up.type == kTypeNvfp4Planes && L.down.type == kTypeNvfp4Planes) {
         // NVFP4 planes: the norm in the quantizer, W4A4 on the TMA products, gate and up as one SwiGLU product, the residual
         // added by down's; H is BF16 (in b.h's buffer), read once by its quantizer
@@ -669,9 +744,9 @@ void window_body(Model& m, SessionState& st, int T, int64_t pos) {
             win_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
         } else {
             const int ai = m.attn_index[(size_t) il];
-            win_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], st.far_kv[(size_t) ai]);
+            win_attn(m, L, lora_layer(m, il), st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], st.far_kv[(size_t) ai]);
         }
-        win_ffn(m, L, T, s);
+        win_ffn(m, L, lora_layer(m, il), T, s);
     }, s);
     if (m.lb > 0) return;   // the second card of a split has no head
     prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, T, g.eps, s), st.logits, T, s);
@@ -747,12 +822,15 @@ namespace {
 
 int32_t* batch_pos0(Model& m) { return reinterpret_cast<int32_t*>(reinterpret_cast<char*>(m.ws.btab) + offsetof(BatchTable, pos0)); }
 
-void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, int rows, cudaStream_t s) {
+void batch_attn(Model& m, const Layer& L, const LoraDev* lw, int ai, const BatchSeg* segs, int S, int rows, cudaStream_t s) {
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim, KV = g.n_kv * g.head_dim;
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.q.type, H, rows, g.eps, s);
     prod_group(m, b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, rows, s);
+    lora_add(m, lw ? &lw[(int) LoraTarget::AttnQ] : nullptr, b.xn, b.qfull, rows, b.lora_r, s);
+    lora_add(m, lw ? &lw[(int) LoraTarget::AttnK] : nullptr, b.xn, b.k, rows, b.lora_r, s);
+    lora_add(m, lw ? &lw[(int) LoraTarget::AttnV] : nullptr, b.xn, b.v, rows, b.lora_r, s);
     // each segment's queries and cache cells, then every segment's attention in one launch
     int row = 0;
     kernels::GqaSeg as[kBatch];
@@ -773,10 +851,10 @@ void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, i
         as[k].far_kv = st.far_kv[(size_t) ai];
         row += T;
     }
-    const bool gated = on_wg(L.o.type);
+    const bool gated = on_wg(L.o.type) && !(lw && lw[(int) LoraTarget::AttnOutput].a);
     kernels::gqa_decode_attn_segs(b.qo, g.n_head, g.n_kv, as, S, b.attn, m.o.max_context, gated ? nullptr : b.ao, s,
                                   gated ? b.qfull : nullptr, gated ? (uint16_t*) b.xq : nullptr);
-    win_attn_out(m, L, rows, s);
+    win_attn_out(m, L, lw, rows, s);
 }
 
 void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int S, int rows, int max_n, cudaStream_t s) {
@@ -834,8 +912,8 @@ void batch_body(Model& m, const BatchSeg* segs, int S) {
         window_layers(m, rows, b.dacc, [&](int il) {
             const Layer& L = w.layers[(size_t) il];
             if (L.kind == Mixer::Gdn) batch_gdn(m, L, m.gdn_index[(size_t) il], segs, S, rows, max_n, s);
-            else batch_attn(m, L, m.attn_index[(size_t) il], segs, S, rows, s);
-            win_ffn(m, L, rows, s);
+            else batch_attn(m, L, lora_layer(m, il), m.attn_index[(size_t) il], segs, S, rows, s);
+            win_ffn(m, L, lora_layer(m, il), rows, s);
         }, s);
         if (m.lb > 0) return;   // the second card of a split has no head
         prod(m, w.head, wnorm(m, b.x, w.out_norm, b.xn, w.head.type, H, rows, g.eps, s), b.hl, rows, s);
@@ -960,11 +1038,11 @@ void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1
             chunk_gdn(m, st, L, m.gdn_index[(size_t) il], T, s);
         } else {
             const int ai = m.attn_index[(size_t) il];
-            chunk_attn(m, L, st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread, st.far_kv[(size_t) ai]);
+            chunk_attn(m, L, lora_layer(m, il), st.kc[(size_t) ai], st.vc[(size_t) ai], T, pos, s, st.kq[(size_t) ai], unread, st.far_kv[(size_t) ai]);
             if (!unread) prefetch_from(il + 1);
         }
         if (unread) break;
-        chunk_ffn(m, L, T, s);
+        chunk_ffn(m, L, lora_layer(m, il), T, s);
         if (taps && next_target < taps->target_layers.size() && taps->target_layers[next_target] == il)
             chunk_tap(m, st, T, *taps, next_target++);
     }
@@ -1189,7 +1267,7 @@ bool mtp_chunk(Model& m, SessionState& st, const float* hid, const int32_t* tok,
     chunk_act(m, cat, d.fc.type, 2 * H, n, s);
     gemm(m, d.fc, b.tmp, n, s);
     kernels::to_bf16(b.tmp, residual(b), (int64_t) n * H, s);   // the chunk path's residual is BF16
-    chunk_attn(m, d.layer, st.mtp_kc, st.mtp_vc, n, c0, s);
+    chunk_attn(m, d.layer, nullptr, st.mtp_kc, st.mtp_vc, n, c0, s);
     return cuda_ok("drafter history", err);
 }
 
@@ -1210,9 +1288,9 @@ bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok
     mtp_input(m, b.tmp, hid, b.cat, n, s);
     prod(m, d.fc, wact(m, b.cat, d.fc.type, 2 * H, n, s), b.tmp, n, s);
     kernels::to_bf16(b.tmp, b.x, (int64_t) n * H, s);
-    win_attn(m, d.layer, st.mtp_kc, st.mtp_vc, n, c0, s);
+    win_attn(m, d.layer, nullptr, st.mtp_kc, st.mtp_vc, n, c0, s);
     if (out) {
-        win_ffn(m, d.layer, n, s);
+        win_ffn(m, d.layer, nullptr, n, s);
         // the head's rows (scaled), of which the last is read
         prod(m, m.w.head, wnorm(m, b.x, d.norm, b.xn, m.w.head.type, H, n, g.eps, s), b.hl, n, s);
         cudaMemcpyAsync(out, b.xn, (size_t) n * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
