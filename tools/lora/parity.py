@@ -28,7 +28,7 @@ import os
 import subprocess
 import sys
 
-LLAMA_REF_DEFAULT = None  # pin after the first run, e.g. "b7xxx" or a full commit hash
+LLAMA_REF_DEFAULT = "f89a243d53c741cecc2b3630e491de61f459294c"  # ggml-org/llama.cpp master, 2026-11-27
 LLAMA_REPO = "https://github.com/ggml-org/llama.cpp"
 
 PROMPTS = [
@@ -102,8 +102,6 @@ def main():
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--workdir", default="/tmp/lora-parity")
     a = ap.parse_args()
-    if not a.llama_ref:
-        sys.exit("--llama-ref is required until LLAMA_REF_DEFAULT is pinned (record it there after the first run)")
     os.makedirs(a.workdir, exist_ok=True)
     cli = build_llama(a.llama_ref, a.workdir)
 
