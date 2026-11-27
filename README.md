@@ -1,5 +1,12 @@
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/basalt-lockup-dark.png"><img src="assets/basalt-lockup-light.png" alt="Basalt" width="480"></picture></p>
 
+> **Fork branch `lora-adapter` (azjhf-dev/basalt).** Adds runtime LoRA adapter support to the dense
+> Qwen3.8-27B stack, targeting the HF harness-hub super-adapter
+> (`harness-hub/Qwen3.8-27B-super-adapter-GGUF`, rank 96, F16). Pinned upstream:
+> jesdga95/basalt @ `d0f35a8f` (v0.5.7-157-gd0f35a8f, 2026-11-26). Fork-only; nothing is sent
+> upstream. Design, injection points and parity plan: [docs/lora.md](docs/lora.md).
+> Status: iteration 1 (design). Not yet implemented.
+
 Basalt is a local inference engine for large language models: **Qwen3.8-Flash-Next**, **DeepSeek-V4.1-Flash**, **Qwen3.8-27B**, **Hy4-flash**, **Inkling 2 Mini** and **ERNIE-5.5-Flash**. It runs
 on an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, and on the DGX Spark (GB10, Arm64), with what does not fit in VRAM
 (the experts of a mixture-of-experts model) in system RAM, and optionally on more GPUs. The server speaks the OpenAI and Anthropic APIs. Website: [basalt.jgulfo.com](https://basalt.jgulfo.com).
