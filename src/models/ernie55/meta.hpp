@@ -26,6 +26,7 @@ struct Geometry {
     int64_t context_length = 0;
     // attention, shared
     int n_head = 0, n_head_kv = 0, head_dim = 0, v_head_dim = 0, q_lora = 0, kv_lora = 0;
+    int mla_qk = 0, mla_v = 0;   ///< MLA qk head dim (nope + rope) and v head dim
     int window = 0, o_groups = 0, o_lora = 0;
     float rms_eps = 0.f;
     std::vector<int> compress_ratio;          ///< per layer; 0 marks an MLA-DSA layer, 128 an HCA layer
@@ -86,6 +87,8 @@ inline std::string geometry_from(const Kv& kv, Geometry& g) {
     if (!(e = get_u("attention.value_length", g.v_head_dim)).empty()) return e;
     if (!(e = get_u("attention.q_lora_rank", g.q_lora)).empty()) return e;
     if (!(e = get_u("attention.kv_lora_rank", g.kv_lora)).empty()) return e;
+    if (!(e = get_u("attention.key_length_mla", g.mla_qk)).empty()) return e;
+    if (!(e = get_u("attention.value_length_mla", g.mla_v)).empty()) return e;
     if (!(e = get_u("attention.sliding_window", g.window)).empty()) return e;
     if (!(e = get_u("attention.output_group_count", g.o_groups)).empty()) return e;
     if (!(e = get_u("attention.output_lora_rank", g.o_lora)).empty()) return e;

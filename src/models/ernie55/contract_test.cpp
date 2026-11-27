@@ -77,6 +77,8 @@ PreviewMaps preview() {
     ui[A + "attention.value_length"] = 512;
     ui[A + "attention.q_lora_rank"] = 1024;
     ui[A + "attention.kv_lora_rank"] = 512;
+    ui[A + "attention.key_length_mla"] = 256;    // 192 nope + 64 rope
+    ui[A + "attention.value_length_mla"] = 256;
     ui[A + "attention.sliding_window"] = 128;
     ui[A + "attention.output_group_count"] = 8;
     ui[A + "attention.output_lora_rank"] = 1024;
@@ -126,6 +128,7 @@ int main() {
         check(e.empty(), "preview geometry parses: " + e);
         check(g.n_layers == 43 && g.n_embd == 4096 && g.n_vocab == 201216, "preview headline dims");
         check(g.n_expert == 512 && g.n_used == 10 && g.n_shared == 1 && g.latent == 2048, "preview MoE dims");
+        check(g.mla_qk == 256 && g.mla_v == 256 && g.mla_qk - g.rope_dim == 192, "preview MLA head dims");
         check(g.dspark_block == 7 && g.dspark_markov_rank == 256 && g.dspark_noise_token == 1024,
               "preview dspark dims");
         check(g.dspark_targets == std::vector<int>({40, 41, 42}), "preview dspark targets");

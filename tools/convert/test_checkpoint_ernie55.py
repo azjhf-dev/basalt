@@ -84,35 +84,35 @@ class TinyCheckpoint:
                 add_f32(pre + f"{kind}_hyper_connection.bias", (24,))
                 for a in ("alpha_pre", "alpha_post", "alpha_res"):
                     add_f32(pre + f"{kind}_hyper_connection.{a}", (1,))
-            add_bf16(pre + "self_attn.vha_postmix_U", (128, 16))
-            add_bf16(pre + "self_attn.vha_postmix_V", (128, 16))
-            if ratios[l] == 128:   # HCA
+            add_bf16(pre + "self_attn.vha_postmix_U", (2, 4))
+            add_bf16(pre + "self_attn.vha_postmix_V", (2, 4))
+            if ratios[l] == 128:   # HCA: 2 heads x 128 dims, q_lora 128, 2 o-groups x 64 lora
                 add_fp8(pre + "self_attn.linear_q_down_proj.weight", 128, H)
                 add_fp8(pre + "self_attn.linear_q_up_proj.weight", 256, 128)
                 add_fp8(pre + "self_attn.linear_kv_proj.weight", 128, H)
-                add_fp8(pre + "self_attn.linear_o_group_proj", 128, H)
+                add_fp8(pre + "self_attn.linear_o_group_proj", 128, 128)
                 add_fp8(pre + "self_attn.o_proj.weight", H, 128)
                 add_bf16(pre + "self_attn.q_layernorm.weight", (128,))
                 add_bf16(pre + "self_attn.kv_layernorm.weight", (128,))
-                add_f32(pre + "self_attn.core_attention.attn_sink", (64,))
-                add_f32(pre + "self_attn.core_attention.compressor.ape", (128, 64))
+                add_f32(pre + "self_attn.core_attention.attn_sink", (2,))
+                add_f32(pre + "self_attn.core_attention.compressor.ape", (128, 128))
                 add_bf16(pre + "self_attn.core_attention.compressor.linear_wkv.weight", (128, H))
                 add_bf16(pre + "self_attn.core_attention.compressor.linear_wgate.weight", (128, H))
                 add_bf16(pre + "self_attn.core_attention.compressor.norm.weight", (128,))
-            else:                  # MLA (DSA)
+            else:                  # MLA (DSA): 2 heads x (96 nope + 32 rope), kv_lora 128, v 64
                 add_fp8(pre + "self_attn.q_a_proj.weight", 128, H)
                 add_fp8(pre + "self_attn.q_b_proj.weight", 256, 128)
                 add_fp8(pre + "self_attn.kv_a_proj_with_mqa.weight", 160, H)
-                add_fp8(pre + "self_attn.kv_b_proj.weight", 256, 128)
-                add_fp8(pre + "self_attn.o_proj.weight", H, 256)
+                add_fp8(pre + "self_attn.kv_b_proj.weight", 320, 128)
+                add_fp8(pre + "self_attn.o_proj.weight", H, 128)
                 add_bf16(pre + "self_attn.q_a_layernorm.weight", (128,))
                 add_bf16(pre + "self_attn.kv_a_layernorm.weight", (128,))
-                add_bf16(pre + "self_attn.core_attention.softmax_offset", (64,))
+                add_bf16(pre + "self_attn.core_attention.softmax_offset", (2,))
                 add_fp8(pre + "self_attn.core_attention.indexer.wq_b.weight", 128, 128)
-                add_bf16(pre + "self_attn.core_attention.indexer.wk.weight", (128, H))
-                add_bf16(pre + "self_attn.core_attention.indexer.weights_proj.weight", (64, H))
-                add_bf16(pre + "self_attn.core_attention.indexer.k_norm.weight", (128,))
-                add_bf16(pre + "self_attn.core_attention.indexer.k_norm.bias", (128,))
+                add_bf16(pre + "self_attn.core_attention.indexer.wk.weight", (64, H))
+                add_bf16(pre + "self_attn.core_attention.indexer.weights_proj.weight", (2, H))
+                add_bf16(pre + "self_attn.core_attention.indexer.k_norm.weight", (64,))
+                add_bf16(pre + "self_attn.core_attention.indexer.k_norm.bias", (64,))
             if l == 0:             # the dense layer
                 add_fp8(pre + "mlp.gate_proj.weight", 128, H)
                 add_fp8(pre + "mlp.up_proj.weight", 128, H)
@@ -156,12 +156,12 @@ class TinyCheckpoint:
         self._write_shard(d / "model-00002-of-00002.safetensors", ["model.embed_tokens.weight"])
         (d / "config.json").write_text(json.dumps({
             "model_type": "ernie5_5_moe", "num_hidden_layers": NL, "hidden_size": H, "vocab_size": VOCAB,
-            "max_position_embeddings": 4096, "num_attention_heads": 64, "num_key_value_heads": 1,
-            "head_dim": 512, "v_head_dim": 512, "hybrid_mla_qk_nope_head_dim": 192,
-            "hybrid_mla_qk_rope_head_dim": 64, "hybrid_mla_v_head_dim": 256, "q_lora_rank": 1024,
-            "kv_lora_rank": 512, "sliding_window": 128, "o_groups": 8, "o_lora_rank": 1024,
+            "max_position_embeddings": 4096, "num_attention_heads": 2, "num_key_value_heads": 1,
+            "head_dim": 128, "v_head_dim": 128, "hybrid_mla_qk_nope_head_dim": 96,
+            "hybrid_mla_qk_rope_head_dim": 32, "hybrid_mla_v_head_dim": 64, "q_lora_rank": 128,
+            "kv_lora_rank": 128, "sliding_window": 128, "o_groups": 2, "o_lora_rank": 64,
             "rms_norm_eps": 1e-6, "compress_ratios": ratios, "compress_rope_theta": 160000.0,
-            "index_n_heads": 64, "index_head_dim": 128, "index_topk": 2048, "qk_rope_head_dim": 64,
+            "index_n_heads": 2, "index_head_dim": 64, "index_topk": 2048, "qk_rope_head_dim": 32,
             "rope_theta": 8000000, "rope_scaling": {"type": "yarn", "factor": 16,
                                                     "original_max_position_embeddings": 65536,
                                                     "beta_fast": 32, "beta_slow": 1},
@@ -274,7 +274,7 @@ class Ernie55Test(unittest.TestCase):
         plan = E.Plan(self.ck)
         u = self.ck.values("model.layers.1.self_attn.vha_postmix_U")
         v = self.ck.values("model.layers.1.self_attn.vha_postmix_V")
-        want = np.eye(128, dtype=np.float32) + v @ u.T
+        want = np.eye(u.shape[0], dtype=np.float32) + v @ u.T
         got = plan._values("blk.1.attn_vha.weight")
         np.testing.assert_allclose(got, want, rtol=1e-6)
         w0 = self.ck.values("model.layers.1.block_sparse_moe.gate.weight")
