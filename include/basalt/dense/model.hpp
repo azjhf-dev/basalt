@@ -22,6 +22,8 @@
 
 namespace basalt::dense {
 
+class LoraAdapter;   // dense/lora.hpp: a runtime LoRA adapter (Options::lora)
+
 enum class Mixer { Gdn, Attention };
 
 /// One projection: `rows` outputs of `cols` inputs, ggml blocks of `type` (Q8_0 8, NVFP4 40, F8_E4M3 44: one E4M3 code
@@ -110,6 +112,9 @@ struct Weights {
 enum class Drafter { None, Mtp, Block };
 
 struct Options {
+    /// The run's LoRA adapter, loaded and resolved by the model's loader (dense/lora.hpp); null: none.  Owned by
+    /// the loader, which outlives the model; a second card's copy of `o` shares it (v1 refuses --lora multi-card).
+    const LoraAdapter* lora = nullptr;
     int64_t max_context = 0;            ///< cells each session holds
     int sessions = 1;
     int spec = 0;                       ///< rows a decode window may hold (0 or 1: one)

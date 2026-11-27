@@ -3,7 +3,7 @@
 Fork-only feature branch: `lora-adapter` on azjhf-dev/basalt. Nothing here is proposed upstream.
 Pinned base: jesdga95/basalt @ `d0f35a8f` (`git describe`: v0.5.7-157-gd0f35a8f, 2026-11-26).
 
-Status: **iteration 1 — design and feasibility. No code yet.**
+Status: **iteration 2 — loader, CLI plumbing, and contract tests landed on branch `lora-adapter`. The adapter loads and validates on CPU; weights are not applied yet (iteration 3, GPU).**
 
 Upstream asks for this in jesdga95/basalt#418 (open since 2026-11-18, no maintainer reply):
 `--lora adapter.gguf --lora-scale 0.8`, multiple adapters, swap without reloading the base.
@@ -121,8 +121,9 @@ Reference implementation: llama.cpp at a pinned commit, serving the card's exact
 1. **Contract tests, CPU, no GPU needed (iteration 2).** Parse the adapter GGUF; check every tensor
    name resolves against the qwen35 geometry, every shape matches its base linear, and alpha parses.
    Cross-check values against the PEFT safetensors (both published): same math, two containers.
-   A CPU reference apply of one FFN layer (x·A·B added to x·Wᵀ) checked against a PyTorch oracle
-   from the PEFT repo.
+   Landed: `src/dense/lora_test.cpp` (8 fixture checks plus real-file mode) and
+   `tools/lora/verify_adapter.py` (GGUF↔PEFT container cross-check; all 512 tensors match, max abs
+   diff 7.1e-06 = F16 rounding).
 2. **Delta parity on GPU (iteration 3, needs Ash's 5090).** llama.cpp's own numbers on an NVFP4/FP8
    base do not exist, so absolute logits against it are dominated by the base quant difference.
    Instead compare *deltas*: for a fixed prompt set, the logit change from adding the adapter must

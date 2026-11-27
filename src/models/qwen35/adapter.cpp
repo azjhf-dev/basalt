@@ -4,6 +4,7 @@
 #include "models/qwen35/adapter.hpp"
 
 #include "basalt/core/diag.hpp"
+#include "basalt/dense/lora.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/loader.hpp"
 #include "basalt/core/prompt_stage.hpp"
@@ -194,6 +195,20 @@ private:
         }
         for (const TensorInfo& t : gg.tensors()) tensors_[t.name] = t;
         dense::Options o = run_options(gg, req.max_context, req.sessions, req.spec, req.draft, req.vision, req.kv, req.kv_resident);
+        if (!req.lora.empty()) {   // a runtime LoRA adapter (dense/lora.hpp): host-validated here, applied from iteration 3
+            if (req.gpus.cards.size() > 1) {
+                err = "qwen35: --lora does not run multi-card yet (the second card would need its own adapter copy)";
+                return false;
+            }
+            if (!lora_.load(req.lora, "qwen35", g, req.lora_scale, err)) return false;
+            o.lora = &lora_;
+            size_t npairs = 0;
+            for (const dense::LoraPair& p : lora_.pairs()) npairs += p.a != nullptr;
+            basalt::log::info("basalt qwen35", "lora: %zu adapted projections, rank %d, scale %.4g, %.2f MiB from %s%s", npairs,
+                              lora_.rank(), (double) lora_.scale(), (double) lora_.bytes() / 1048576.0, req.lora.c_str(),
+                              lora_.alpha_defaulted() ? "; the file has no alpha, the scale is --lora-scale alone" : "");
+            basalt::log::warn("basalt qwen35", "lora: the adapter is loaded and checked but not applied yet (fork iteration 3)");
+        }
         const bool want_block = o.drafter == dense::Drafter::Block, want_mtp = o.drafter == dense::Drafter::Mtp;
         dense::BlockDrafter bd_meta;
         if (want_block && !block_meta(gg, bd_meta, g.n_embd, err)) return false;
@@ -654,6 +669,7 @@ private:
     const dense::Options* opt_ = nullptr;
     const dense::BlockDrafter* bd_ = nullptr;
     const model::LoadRequest* req_ = nullptr;
+    dense::LoraAdapter lora_;          // --lora's adapter (host-mapped until the device upload lands)
 };
 
 class Adapter final : public model::ModelAdapter {
@@ -675,6 +691,8 @@ public:
         if (model::parse_rope_flag(a, args, o.rope)) {}
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--kv") o.kv = args.next("--kv");
+        else if (a == "--lora") o.lora = args.next("--lora");
+        else if (a == "--lora-scale") o.lora_scale = (float) std::atof(args.next("--lora-scale"));
         else if (a == "--kv-resident") o.kv_resident = std::atoll(args.next("--kv-resident"));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(args.next("--suffix-draft")));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
@@ -695,6 +713,10 @@ public:
         }
         if (o.kv == "nvfp4" && o.kv_resident > 0) {
             basalt::log::error("basalt qwen35", "--kv nvfp4 keeps every cell on the card: leave --kv-resident off");
+            return 2;
+        }
+        if (o.lora_scale < 0.0f) {
+            basalt::log::error("basalt qwen35", "--lora-scale %g: 0 or more", (double) o.lora_scale);
             return 2;
         }
         if (const auto code = model::check_rope_flags(o.rope, "basalt qwen35")) return code;

@@ -46,6 +46,10 @@ struct CommonOptions {
     int peer_reserve_mib = 600;
     bool no_prompt_skip = false;  ///< --no-prompt-skip: every prompt row through every layer
     std::string kv;               ///< --kv: the KV storage, as each model names it (empty: the model's default)
+    /// --lora FILE: a llama.cpp-format LoRA adapter GGUF applied at run time (the models that take it: qwen35).
+    /// --lora-scale S multiplies the adapter's own alpha/rank scale (default 1.0).
+    std::string lora;
+    float lora_scale = 1.0f;
     /// --rope-scaling, --rope-scale, --yarn-* ...: taken by the models that extend their context (basalt/model/rope_flags.hpp)
     basalt::model::RopeFlags rope;
     /// --route-tail-skip, --route-prior: taken by the mixture-of-experts models (basalt/model/route_flags.hpp)
