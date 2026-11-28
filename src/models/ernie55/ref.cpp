@@ -375,28 +375,36 @@ bool load_mla(const std::string& path, const Pack& p, int layer, MlaWeights& w, 
 
 // ------------------------------------------------------------ HCA
 
-std::vector<Vec> hca_forward(const Geometry& g, const HcaWeights& w, const std::vector<Vec>& x) {
+HcaPrepared hca_prepare(const Geometry& g, const HcaWeights& w, const std::vector<Vec>& x) {
     const int T = (int) x.size();
     const int nh = g.n_head, hd = g.head_dim, ratio = g.compress_ratio[0] ? g.compress_ratio[0] : 128;
-    const int og = g.o_groups, ol = g.o_lora, hpg = nh / og;
     const float eps = g.rms_eps;
     const RopeParams rope = hca_rope(g);
     const int off = hd - g.rope_dim;
-    const float scale = 1.f / std::sqrt((float) hd);
 
-    std::vector<Vec> qr(T), q(T * nh), kv(T), skv(T), ssc(T);
+    HcaPrepared p;
+    p.T = T;
+    p.qr.resize(T);
+    p.q.resize((size_t) T * nh * hd);
+    p.kv.resize((size_t) T * hd);
+    std::vector<Vec> skv(T), ssc(T);
     for (int t = 0; t < T; ++t) {
-        qr[t] = matvec(w.q_a, x[t].data());
-        rmsnorm_inplace(qr[t], &w.q_a_norm, eps);
-        Vec qf = matvec(w.q_b, qr[t].data());
+        p.qr[t] = matvec(w.q_a, x[t].data());
+        rmsnorm_inplace(p.qr[t], &w.q_a_norm, eps);
+        Vec qf = matvec(w.q_b, p.qr[t].data());
         for (int h = 0; h < nh; ++h) {
-            q[t * nh + h].assign(qf.begin() + h * hd, qf.begin() + (h + 1) * hd);
-            rmsnorm_inplace(q[t * nh + h], nullptr, eps);
-            rope_inplace(q[t * nh + h].data(), off, t, rope);
+            float* qh = p.q.data() + ((size_t) t * nh + h) * hd;
+            std::copy(qf.begin() + h * hd, qf.begin() + (h + 1) * hd, qh);
+            Vec qhv(qh, qh + hd);
+            rmsnorm_inplace(qhv, nullptr, eps);
+            std::copy(qhv.begin(), qhv.end(), qh);
+            rope_inplace(qh, off, t, rope);
         }
-        kv[t] = matvec(w.kv, x[t].data());
-        rmsnorm_inplace(kv[t], &w.kv_norm, eps);
-        rope_inplace(kv[t].data(), off, t, rope);
+        float* kvt = p.kv.data() + (size_t) t * hd;
+        Vec kvv = matvec(w.kv, x[t].data());
+        rmsnorm_inplace(kvv, &w.kv_norm, eps);
+        std::copy(kvv.begin(), kvv.end(), kvt);
+        rope_inplace(kvt, off, t, rope);
         skv[t] = matvec(w.comp_kv, x[t].data());
         ssc[t] = matvec(w.comp_gate, x[t].data());
         for (int d = 0; d < hd; ++d) ssc[t][d] += w.ape.row(t % ratio)[d];
@@ -404,43 +412,64 @@ std::vector<Vec> hca_forward(const Geometry& g, const HcaWeights& w, const std::
 
     // the compressor: one entry per completed block, a per-dim softmax over the block's positions
     const int nb = T / ratio;
-    std::vector<Vec> comp(nb, Vec(hd, 0.f));
+    p.nb = nb;
+    p.comp.resize((size_t) nb * hd, 0.f);
     for (int b = 0; b < nb; ++b) {
+        Vec compb(hd, 0.f);
         for (int d = 0; d < hd; ++d) {
             float mx = -kInf;
             for (int i = 0; i < ratio; ++i) mx = std::max(mx, ssc[b * ratio + i][d]);
             double den = 0.0;
             for (int i = 0; i < ratio; ++i) den += std::exp((double) ssc[b * ratio + i][d] - mx);
             for (int i = 0; i < ratio; ++i)
-                comp[b][d] += (float) (std::exp((double) ssc[b * ratio + i][d] - mx) / den) *
-                              skv[b * ratio + i][d];
+                compb[d] += (float) (std::exp((double) ssc[b * ratio + i][d] - mx) / den) *
+                            skv[b * ratio + i][d];
         }
-        rmsnorm_inplace(comp[b], &w.comp_norm, eps);
-        rope_inplace(comp[b].data(), off, (int64_t) (b + 1) * ratio - 1, rope);
+        rmsnorm_inplace(compb, &w.comp_norm, eps);
+        std::copy(compb.begin(), compb.end(), p.comp.data() + (size_t) b * hd);
+        rope_inplace(p.comp.data() + (size_t) b * hd, off, (int64_t) (b + 1) * ratio - 1, rope);
     }
+    return p;
+}
+
+void hca_attention_ref(const Geometry& g, const HcaWeights& w, const HcaPrepared& p, int t, int h,
+                       float* out) {
+    const int nh = g.n_head, hd = g.head_dim, ratio = g.compress_ratio[0] ? g.compress_ratio[0] : 128;
+    const float scale = 1.f / std::sqrt((float) hd);
+    const int j0 = std::max(0, t - g.window + 1);
+    const int nraw = t - j0 + 1;
+    const int ncomp = t / ratio;   // completed blocks strictly before this token's block
+    const float* qh = p.q.data() + ((size_t) t * nh + h) * hd;
+    Vec scores(nraw + ncomp);
+    for (int j = j0; j <= t; ++j)
+        scores[j - j0] = scale * dot(qh, p.kv.data() + (size_t) j * hd, hd);
+    for (int b = 0; b < ncomp; ++b)
+        scores[nraw + b] = scale * dot(qh, p.comp.data() + (size_t) b * hd, hd);
+    const Vec pr = softmax_with_sink(scores, w.sinks[h]);
+    std::fill(out, out + hd, 0.f);
+    for (int j = j0; j <= t; ++j)
+        for (int d = 0; d < hd; ++d) out[d] += pr[j - j0] * p.kv[(size_t) j * hd + d];
+    for (int b = 0; b < ncomp; ++b)
+        for (int d = 0; d < hd; ++d) out[d] += pr[nraw + b] * p.comp[(size_t) b * hd + d];
+}
+
+std::vector<Vec> hca_forward(const Geometry& g, const HcaWeights& w, const std::vector<Vec>& x) {
+    const HcaPrepared p = hca_prepare(g, w, x);
+    const int T = p.T;
+    const int nh = g.n_head, hd = g.head_dim;
+    const int og = g.o_groups, ol = g.o_lora, hpg = nh / og;
+    const RopeParams rope = hca_rope(g);
+    const int off = hd - g.rope_dim;
 
     std::vector<Vec> out(T, Vec(g.n_embd, 0.f));
     for (int t = 0; t < T; ++t) {
-        const int j0 = std::max(0, t - g.window + 1);
-        const int nraw = t - j0 + 1;
-        const int ncomp = t / ratio;   // completed blocks strictly before this token's block
         std::vector<Vec> heads(nh, Vec(hd, 0.f));
-        Vec scores(nraw + ncomp);
         for (int h = 0; h < nh; ++h) {
-            for (int j = j0; j <= t; ++j) scores[j - j0] = scale * dot(q[t * nh + h].data(), kv[j].data(), hd);
-            for (int b = 0; b < ncomp; ++b)
-                scores[nraw + b] = scale * dot(q[t * nh + h].data(), comp[b].data(), hd);
-            const Vec p = softmax_with_sink(scores, w.sinks[h]);
-            Vec acc(hd, 0.f);
-            for (int j = j0; j <= t; ++j)
-                for (int d = 0; d < hd; ++d) acc[d] += p[j - j0] * kv[j][d];
-            for (int b = 0; b < ncomp; ++b)
-                for (int d = 0; d < hd; ++d) acc[d] += p[nraw + b] * comp[b][d];
-            heads[h] = acc;
+            hca_attention_ref(g, w, p, t, h, heads[h].data());
             rope_back_inplace(heads[h].data(), off, t, rope);
         }
         head_mix(heads, w.vha);
-        const Vec gatev = matvec(w.gate, qr[t].data());
+        const Vec gatev = matvec(w.gate, p.qr[t].data());
         Vec oa(og * ol);
         for (int gg = 0; gg < og; ++gg) {
             Vec slice(hpg * hd);

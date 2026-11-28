@@ -93,6 +93,26 @@ struct MlaWeights {
 bool load_hca(const std::string& path, const Pack& p, int layer, HcaWeights& w, std::string& err);
 bool load_mla(const std::string& path, const Pack& p, int layer, MlaWeights& w, std::string& err);
 
+/// The prepared attention inputs of one HCA layer: everything before the per-(token, head) attention core,
+/// flattened the way the CUDA kernel consumes it. Produced by hca_prepare.
+struct HcaPrepared {
+    std::vector<Vec> qr;  ///< [T][q_lora] normalized low-rank query (drives the output gate)
+    Vec q;                ///< [T*nh*hd] roped per-head queries, (t*nh + h)*hd
+    Vec kv;               ///< [T*hd] roped raw KV
+    Vec comp;             ///< [nb*hd] normed + roped compressed block entries
+    int nb = 0;           ///< completed compressed blocks, T / ratio
+    int T = 0;
+};
+
+/// The pre-attention half of hca_forward: low-rank query, roped q/kv, and the compressor. Exposed so the
+/// kernel parity test can feed the CUDA attention core exactly what the reference feeds its own.
+HcaPrepared hca_prepare(const Geometry& g, const HcaWeights& w, const std::vector<Vec>& x);
+
+/// One (token, head) of the HCA attention core: softmax-with-sink over the sliding raw window plus the
+/// completed compressed blocks, weighted sum of the same vectors, written pre-inverse-rope into out[hd].
+void hca_attention_ref(const Geometry& g, const HcaWeights& w, const HcaPrepared& p, int t, int h,
+                       float* out);
+
 /// One HCA attention block over x[0..T) (post-attn_norm hidden states), returning out[0..T) (pre hc-post).
 std::vector<Vec> hca_forward(const Geometry& g, const HcaWeights& w, const std::vector<Vec>& x);
 

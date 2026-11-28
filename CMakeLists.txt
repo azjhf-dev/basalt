@@ -223,11 +223,10 @@ endif()
 endif()
 
 if(BASALT_MODEL_ERNIE55)
-# ERNIE 5.5 Flash Preview: adapter plus the hparams and tensor contract. The compute path (HCA / MLA-DSA
-# attention, latent MoE, mHC, MultiMax, DSpark) does not exist yet, so the adapter fails closed at load.
-# No CUDA sources. ref.cpp is the plain-CPU reference for one HCA layer and one MLA-DSA layer used by the
-# test suite to pin the math before kernels are written.
-add_library(model_ernie55 STATIC src/models/ernie55/adapter.cpp src/models/ernie55/pack.cpp src/models/ernie55/ref.cpp)
+# ERNIE 5.5 Flash Preview: adapter plus the hparams and tensor contract. The compute path is being built
+# kernel by kernel against the plain-CPU reference (ref.cpp); hca_attention.cu is the first one. MoE, mHC,
+# MultiMax and DSpark do not exist yet, so the adapter fails closed at load.
+add_library(model_ernie55 STATIC src/models/ernie55/adapter.cpp src/models/ernie55/pack.cpp src/models/ernie55/ref.cpp src/models/ernie55/kernels/hca_attention.cu)
 target_include_directories(model_ernie55 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
 target_link_libraries(model_ernie55 PUBLIC model core ${_gpu_runtime_target})
 if(BUILD_TESTING)
@@ -247,6 +246,12 @@ if(BUILD_TESTING)
   target_include_directories(ernie55_ref_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(ernie55_ref_test PRIVATE model_ernie55 warnings)
   basalt_cpu_test(NAME ernie55_ref_test COMMAND ernie55_ref_test)
+  # the HCA attention kernel against the CPU reference (GPU path on this build; the same source compiles
+  # host-only with -x c++ for machines without a toolkit, which is how CI-less hosts run it)
+  add_executable(ernie55_kernel_test src/models/ernie55/kernel_test.cpp)
+  target_include_directories(ernie55_kernel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(ernie55_kernel_test PRIVATE model_ernie55 warnings)
+  basalt_cpu_test(NAME ernie55_kernel_test COMMAND ernie55_kernel_test)
 endif()
 endif()
 
